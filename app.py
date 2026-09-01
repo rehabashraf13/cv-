@@ -393,6 +393,131 @@ def validate_mapping(mapping, lines):
     }
 
 
+
+def repair_missing_line_ids(mapping, lines):
+    """Fill only genuinely missing source IDs without rewriting source text.
+
+    Groq occasionally omits one ID even when the structured response is otherwise
+    valid.  The CV renderer works from original line IDs, so attaching a missing
+    ID to the nearest existing group preserves the exact source text and avoids
+    failing the whole CV for a single omission.
+
+    Unknown IDs and duplicate IDs are intentionally NOT repaired here; those are
+    still treated as hard validation errors by validate_mapping().
+    """
+    repaired = copy.deepcopy(mapping)
+    sections = repaired.get("sections")
+
+    if not isinstance(sections, list):
+        return repaired
+
+    expected_order = [line["id"] for line in lines]
+    expected = set(expected_order)
+    used = []
+
+    for section in sections:
+        if not isinstance(section, dict):
+            return repaired
+
+        headings = section.get("heading_ids", [])
+        groups = section.get("groups", [])
+
+        if isinstance(headings, list):
+            used.extend(i for i in headings if type(i) is int)
+
+        if isinstance(groups, list):
+            for group in groups:
+                if isinstance(group, list):
+                    used.extend(i for i in group if type(i) is int)
+
+    counts = collections.Counter(used)
+
+    # Never hide more serious model errors.
+    if any(i not in expected for i in used):
+        return repaired
+    if any(count > 1 for count in counts.values()):
+        return repaired
+
+    missing = [i for i in expected_order if i not in counts]
+    if not missing:
+        return repaired
+
+    def group_locations():
+        locations = {}
+        for section_index, section in enumerate(sections):
+            groups = section.get("groups", [])
+            if not isinstance(groups, list):
+                continue
+            for group_index, group in enumerate(groups):
+                if not isinstance(group, list):
+                    continue
+                for item in group:
+                    if type(item) is int:
+                        locations[item] = (section_index, group_index)
+        return locations
+
+    for missing_id in missing:
+        locations = group_locations()
+        mapped_group_ids = sorted(locations)
+
+        target = None
+        previous_ids = [i for i in mapped_group_ids if i < missing_id]
+        next_ids = [i for i in mapped_group_ids if i > missing_id]
+        prev_id = previous_ids[-1] if previous_ids else None
+        next_id = next_ids[0] if next_ids else None
+
+        # Strongest signal: the missing line lies inside one existing entry.
+        if (
+            prev_id is not None
+            and next_id is not None
+            and locations[prev_id] == locations[next_id]
+        ):
+            target = locations[prev_id]
+        elif prev_id is not None and next_id is not None:
+            # Prefer whichever neighboring source line is closer.
+            if missing_id - prev_id <= next_id - missing_id:
+                target = locations[prev_id]
+            else:
+                target = locations[next_id]
+        elif prev_id is not None:
+            target = locations[prev_id]
+        elif next_id is not None:
+            target = locations[next_id]
+
+        if target is not None:
+            section_index, group_index = target
+            group = sections[section_index]["groups"][group_index]
+            group.append(missing_id)
+            group.sort(key=lambda value: expected_order.index(value))
+            continue
+
+        # Extremely unusual fallback: preserve the source line in Additional
+        # Information rather than dropping it or blocking PDF generation.
+        custom = next(
+            (
+                section for section in sections
+                if isinstance(section, dict)
+                and section.get("kind") == "custom"
+                and not section.get("heading_ids")
+            ),
+            None,
+        )
+
+        if custom is None:
+            custom = {
+                "kind": "custom",
+                "heading_ids": [],
+                "groups": [],
+                "roles": [],
+                "continues_previous": False,
+            }
+            sections.append(custom)
+
+        custom["groups"].append([missing_id])
+
+    return repaired
+
+
 def parse_json_reply(text):
     text = text.strip()
 
@@ -433,33 +558,55 @@ def batches(lines):
 
 
 def merge_part(existing, incoming):
+    """
+    Merge one Groq batch into the accumulated CV mapping.
+
+    Groq can occasionally mark the first section of a new batch as
+    continues_previous=True even when the boundary conditions do not actually
+    describe a continuation. That flag is only a structural hint; source-line
+    IDs remain the source of truth. Therefore an invalid continuation hint is
+    downgraded to a normal section merge instead of aborting the whole CV.
+    """
     result = copy.deepcopy(existing)
 
     for index, source in enumerate(incoming):
         section = copy.deepcopy(source)
-        continuation = section.pop("continues_previous", False)
+        continuation = bool(section.pop("continues_previous", False))
 
-        if continuation:
-            if (
-                index != 0
-                or not result
-                or not result[-1]["groups"]
-                or not section["groups"]
-                or section["heading_ids"]
-                or result[-1]["kind"] != section["kind"]
-            ):
-                raise ValueError("Invalid continuation across batches.")
+        continuation_is_valid = (
+            continuation
+            and index == 0
+            and bool(result)
+            and bool(result[-1].get("groups"))
+            and bool(section.get("groups"))
+            and not section.get("heading_ids")
+            and result[-1].get("kind") == section.get("kind")
+        )
 
+        if continuation_is_valid and section.get("kind") == "personal":
+            previous_roles = result[-1].get("roles", [])
+            current_roles = section.get("roles", [])
+
+            # If Groq gives inconsistent personal roles at a batch boundary,
+            # treat the section as a normal merge rather than destroying data.
+            continuation_is_valid = (
+                bool(previous_roles)
+                and bool(current_roles)
+                and previous_roles[-1] == current_roles[0]
+            )
+
+        if continuation_is_valid:
             if section["kind"] == "personal":
-                if result[-1]["roles"][-1] != section["roles"][0]:
-                    raise ValueError("Personal continuation role mismatch.")
-
+                # The first role belongs to the group that is being continued.
                 section["roles"].pop(0)
 
             result[-1]["groups"][-1].extend(
                 section["groups"].pop(0)
             )
 
+        # Whether the continuation flag was valid or not, preserve every
+        # remaining group. Same-kind sections without a heading can safely be
+        # merged into the previous section; otherwise append a new section.
         if (
             result
             and result[-1]["kind"] == section["kind"]
@@ -635,6 +782,11 @@ def classify(lines, api_key, model, progress):
                         choice.message.content or ""
                     )
 
+                    # Groq can occasionally skip a single source-line ID even
+                    # though the rest of the structure is correct. Repair only
+                    # missing IDs deterministically; exact source text is still
+                    # taken from the original CV and never regenerated.
+                    mapping = repair_missing_line_ids(mapping, part)
                     validate_mapping(mapping, part)
 
                     candidate = merge_part(
@@ -2345,35 +2497,39 @@ with st.container(key="builder"):
     </div>
     """)
 
-    key_missing = not os.getenv("GROQ_API_KEY", "").strip()
+    # Groq configuration is loaded automatically.
+    # Local/dev: .env beside this file.
+    # Streamlit Cloud: Secrets are used as a safe fallback.
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
 
-    with st.expander(
-        "إعدادات الاتصال · Groq API",
-        expanded=key_missing,
-    ):
-        api_key = st.text_input(
-            "مفتاح Groq API",
-            value=os.getenv("GROQ_API_KEY", ""),
-            type="password",
-            key="cv_api_key",
-        )
+    if not api_key:
+        try:
+            api_key = str(st.secrets.get("GROQ_API_KEY", "")).strip()
+        except Exception:
+            api_key = ""
 
-        default_model = os.getenv(
-            "GROQ_MODEL",
-            "openai/gpt-oss-120b",
-        )
+    default_model = os.getenv("GROQ_MODEL", "").strip()
 
-        model = st.selectbox(
-            "الموديل",
-            MODELS,
-            index=MODELS.index(default_model)
-            if default_model in MODELS else 0,
-            key="cv_model",
-        )
+    if not default_model:
+        try:
+            default_model = str(
+                st.secrets.get("GROQ_MODEL", "openai/gpt-oss-120b")
+            ).strip()
+        except Exception:
+            default_model = "openai/gpt-oss-120b"
 
-        st.caption(
-            "نص سيرتك الذاتية بيتبعت إلى Groq للتحليل. "
-            "مفتاح الـAPI مش بيتضاف في ملف الـPDF."
+    model = (
+        default_model
+        if default_model in MODELS
+        else "openai/gpt-oss-120b"
+    )
+
+    if api_key:
+        st.success("🤖 Groq AI جاهز للتحليل تلقائيًا.")
+    else:
+        st.warning(
+            "لم يتم العثور على GROQ_API_KEY. "
+            "أضيفيه إلى ملف .env محليًا أو إلى Streamlit Secrets عند النشر."
         )
 
     input_col, preferences_col = st.columns(
@@ -2522,7 +2678,8 @@ with st.container(key="builder"):
             and not api_key.strip()
         ):
             st.error(
-                "افتحي إعدادات الاتصال فوق وأدخلي مفتاح Groq API."
+                "لم يتم العثور على GROQ_API_KEY. "
+                "تأكدي أنه موجود في ملف .env أو Streamlit Secrets."
             )
 
         else:
