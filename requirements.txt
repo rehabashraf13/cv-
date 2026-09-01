@@ -4,3 +4,10 @@ python-dotenv
 pandas
 PyPDF2
 python-docx
+streamlit
+PyMuPDF
+openai
+python-docx
+python-dotenv
+Pillow
+playwright
