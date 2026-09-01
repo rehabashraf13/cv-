@@ -856,8 +856,27 @@ PLACEHOLDER_SVG = (
 )
 
 
-def build_html(mapping, lines, language, style, photo=None):
+def build_html(mapping, lines, language, style, photo=None, options=None):
     validate_mapping(mapping, lines)
+
+    options = options or {}
+    page_mode = options.get("page_mode", "one")
+    font_family = options.get("font_family", "Arial")
+    body_font_size = float(options.get("body_font_size", 10.0))
+    heading_font_size = float(options.get("heading_font_size", 13.5))
+    heading_weight = int(options.get("heading_weight", 700))
+    heading_align = options.get("heading_align", "start")
+    contact_position = options.get("contact_position", "template")
+    bullet_style = options.get("bullet_style", "preserve")
+    compactness = options.get("compactness", "auto")
+
+    safe_font = {
+        "Arial": 'Arial, "Segoe UI", sans-serif',
+        "Calibri": 'Calibri, Arial, sans-serif',
+        "Times New Roman": '"Times New Roman", Times, serif',
+        "Georgia": 'Georgia, "Times New Roman", serif',
+        "Noto Sans Arabic": '"Noto Sans Arabic", Arial, sans-serif',
+    }.get(font_family, 'Arial, "Segoe UI", sans-serif')
 
     by_id = {line["id"]: line for line in lines}
     arabic = language == "ar"
@@ -920,6 +939,15 @@ def build_html(mapping, lines, language, style, photo=None):
 
     details = contacts + other
 
+    if contact_position == "top":
+        has_side_for_contacts = False
+    elif contact_position == "below_name":
+        has_side_for_contacts = False
+    elif contact_position == "sidebar":
+        has_side_for_contacts = has_side
+    else:
+        has_side_for_contacts = has_side
+
     if has_side:
         if photo:
             encoded = base64.b64encode(photo).decode("ascii")
@@ -935,7 +963,7 @@ def build_html(mapping, lines, language, style, photo=None):
                 '<div class="portrait placeholder">' + PLACEHOLDER_SVG + "</div>"
             )
 
-        if details:
+        if details and has_side_for_contacts:
             label = "التواصل" if arabic else "Contact"
             side_blocks.append(
                 "<h2>" + html.escape(heading_text(label)) + "</h2>"
@@ -947,16 +975,42 @@ def build_html(mapping, lines, language, style, photo=None):
         if name or title:
             main_blocks.append(identity)
 
-    elif name or title or details:
-        main_blocks.append(
-            '<div class="classic-header">' 
-            + identity
-            + '<div class="contact-list">'
-            + "".join(
+        if details and not has_side_for_contacts:
+            contact_html = "".join(
                 paragraph(value, "contact") for value in details
             )
-            + "</div></div>"
+            if contact_position == "top":
+                main_blocks.insert(
+                    0,
+                    '<div class="contact-list contact-top">' + contact_html + "</div>"
+                )
+            else:
+                main_blocks.append(
+                    '<div class="contact-list contact-below-name">' + contact_html + "</div>"
+                )
+
+    elif name or title or details:
+        contact_html = "".join(
+            paragraph(value, "contact") for value in details
         )
+
+        if contact_position == "top" and details:
+            main_blocks.append(
+                '<div class="contact-list contact-top">' + contact_html + "</div>"
+            )
+            main_blocks.append(identity)
+        elif contact_position == "below_name" and details:
+            main_blocks.append(
+                '<div class="classic-header single-column">'
+                + identity
+                + '<div class="contact-list">' + contact_html + "</div></div>"
+            )
+        else:
+            main_blocks.append(
+                '<div class="classic-header">'
+                + identity
+                + '<div class="contact-list">' + contact_html + "</div></div>"
+            )
 
     sections.sort(
         key=lambda section: SECTION_ORDER.index(section["kind"])
@@ -982,11 +1036,25 @@ def build_html(mapping, lines, language, style, photo=None):
                 buffer.clear()
 
         for index, text in enumerate(texts[1:], start=1):
-            bullet = bool(re.match(r"^[•●▪\-]\s*", text))
+            bullet_match = re.match(r"^([•●▪\-])\s*", text)
+            bullet = bool(bullet_match)
             bold = by_id[group[index]].get("bold", False)
 
             if bullet or bold:
                 flush()
+
+            if bullet:
+                clean_text = re.sub(r"^[•●▪\-]\s*", "", text)
+
+                if bullet_style == "preserve":
+                    rendered = text
+                elif bullet_style == "none":
+                    rendered = clean_text
+                else:
+                    rendered = bullet_style + " " + clean_text
+
+                blocks.append(paragraph(rendered, "bullet-line"))
+                continue
 
             buffer.append(text)
 
@@ -1021,9 +1089,9 @@ def build_html(mapping, lines, language, style, photo=None):
     html, body { margin: 0; padding: 0; background: white; }
 
     body {
-        font-family: Arial, "Segoe UI", sans-serif;
-        font-size: 10pt;
-        line-height: 1.4;
+        font-family: __FONT_FAMILY__;
+        font-size: __BODY_FONT_SIZE__pt;
+        line-height: __LINE_HEIGHT__;
         color: #4c4c4c;
     }
 
@@ -1073,7 +1141,6 @@ def build_html(mapping, lines, language, style, photo=None):
 
     .classic, .ats {
         color: #111;
-        font-size: 10.5pt;
     }
     .classic {
         font-family: "Times New Roman", Arial, serif;
@@ -1108,10 +1175,12 @@ def build_html(mapping, lines, language, style, photo=None):
     .template3 .identity { border-bottom-color: #595959; }
 
     h2 {
-        margin: 5mm 0 2.5mm;
-        padding-bottom: 1.5mm;
-        font-size: 13.5pt;
+        margin: __H2_MARGIN_TOP__mm 0 __H2_MARGIN_BOTTOM__mm;
+        padding-bottom: __H2_PADDING_BOTTOM__mm;
+        font-size: __HEADING_FONT_SIZE__pt;
         line-height: 1.2;
+        font-weight: __HEADING_WEIGHT__;
+        text-align: __HEADING_ALIGN__;
         border-bottom: 0.4mm solid #193d54;
         color: #193d54;
         overflow-wrap: anywhere;
@@ -1155,10 +1224,14 @@ def build_html(mapping, lines, language, style, photo=None):
         overflow-wrap: anywhere;
     }
     p {
-        margin: 0 0 2.5mm;
+        margin: 0 0 __P_MARGIN__mm;
         overflow-wrap: anywhere;
         white-space: pre-wrap;
     }
+    .bullet-line { margin-bottom: __BULLET_MARGIN__mm; }
+    .contact-top { margin-bottom: 3mm; }
+    .contact-below-name { margin-bottom: 4mm; }
+    .single-column { grid-template-columns: 1fr; gap: 2mm; }
     .contact { margin-bottom: 3mm; }
 
     .portrait {
@@ -1182,6 +1255,24 @@ def build_html(mapping, lines, language, style, photo=None):
         border-width: 1mm;
     }
 
+    .fit-one .lane {
+        top: 8mm;
+        bottom: 9mm;
+    }
+    .fit-one h1 {
+        margin-bottom: 1.5mm;
+        line-height: 1.05;
+    }
+    .fit-one .identity { margin-bottom: 3mm; }
+    .fit-one h2 { margin-top: 2.5mm; }
+    .fit-one h3 { margin-top: 1.6mm; margin-bottom: 0.8mm; }
+    .fit-one .contact { margin-bottom: 1.5mm; }
+
+    .fit-two .lane {
+        top: 11mm;
+        bottom: 11mm;
+    }
+
     .page-number {
         position: absolute;
         bottom: 5mm;
@@ -1190,6 +1281,42 @@ def build_html(mapping, lines, language, style, photo=None):
         color: #777;
     }
     """
+
+    if page_mode == "one":
+        line_height = 1.22 if compactness in {"auto", "compact"} else 1.3
+        p_margin = 1.2
+        bullet_margin = 0.9
+        h2_top = 2.6
+        h2_bottom = 1.3
+        h2_pad = 0.8
+    elif page_mode == "two":
+        line_height = 1.32
+        p_margin = 2.0
+        bullet_margin = 1.4
+        h2_top = 4.0
+        h2_bottom = 2.0
+        h2_pad = 1.2
+    else:
+        line_height = 1.4
+        p_margin = 2.5
+        bullet_margin = 1.8
+        h2_top = 5.0
+        h2_bottom = 2.5
+        h2_pad = 1.5
+
+    css = (
+        css.replace("__FONT_FAMILY__", safe_font)
+        .replace("__BODY_FONT_SIZE__", f"{body_font_size:g}")
+        .replace("__LINE_HEIGHT__", f"{line_height:g}")
+        .replace("__HEADING_FONT_SIZE__", f"{heading_font_size:g}")
+        .replace("__HEADING_WEIGHT__", str(heading_weight))
+        .replace("__HEADING_ALIGN__", heading_align)
+        .replace("__P_MARGIN__", f"{p_margin:g}")
+        .replace("__BULLET_MARGIN__", f"{bullet_margin:g}")
+        .replace("__H2_MARGIN_TOP__", f"{h2_top:g}")
+        .replace("__H2_MARGIN_BOTTOM__", f"{h2_bottom:g}")
+        .replace("__H2_PADDING_BOTTOM__", f"{h2_pad:g}")
+    )
 
     script = r"""
     window.layoutDone = false;
@@ -1200,11 +1327,22 @@ def build_html(mapping, lines, language, style, photo=None):
             await document.fonts.ready;
 
             const hasSide = document.body.classList.contains("sidebar");
+            const forcedOne = document.body.classList.contains("fit-one");
+            const forcedTwo = document.body.classList.contains("fit-two");
+            const maxPages = forcedOne ? 1 : (forcedTwo ? 2 : null);
             const pages = [];
             const root = document.getElementById("pages");
 
             function getPage(index) {
                 while (pages.length <= index) {
+                    if (maxPages !== null && index >= maxPages) {
+                        throw new Error(
+                            forcedOne
+                                ? "المحتوى أكبر من صفحة واحدة بالإعدادات الحالية. قللي حجم الخط أو اختاري صفحتين."
+                                : "المحتوى أكبر من صفحتين بالإعدادات الحالية."
+                        );
+                    }
+
                     const sheet = document.createElement("div");
                     sheet.className = "sheet";
 
@@ -1375,6 +1513,8 @@ def build_html(mapping, lines, language, style, photo=None):
         style_class
         + (" sidebar" if has_side else "")
         + (" rtl" if arabic else "")
+        + (" fit-one" if page_mode == "one" else "")
+        + (" fit-two" if page_mode == "two" else "")
     )
 
     return (
@@ -2607,6 +2747,107 @@ with st.container(key="builder"):
             "ده بيتحكم في اتجاه التنسيق فقط؛ مش بيترجم نصك."
         )
 
+        with st.expander("تخصيص التنسيق", expanded=True):
+            page_mode = st.radio(
+                "عدد الصفحات",
+                ["one", "two", "auto"],
+                format_func=lambda value: {
+                    "one": "صفحة واحدة",
+                    "two": "صفحتان",
+                    "auto": "تلقائي",
+                }[value],
+                horizontal=True,
+                key="cv_page_mode",
+            )
+
+            font_family = st.selectbox(
+                "نوع الخط",
+                ["Arial", "Calibri", "Times New Roman", "Georgia", "Noto Sans Arabic"],
+                index=0,
+                key="cv_font_family",
+            )
+
+            body_font_size = st.slider(
+                "حجم النص",
+                min_value=8.0,
+                max_value=13.0,
+                value=10.0,
+                step=0.5,
+                key="cv_body_font_size",
+            )
+
+            heading_font_size = st.slider(
+                "حجم عناوين الأقسام",
+                min_value=11.0,
+                max_value=18.0,
+                value=13.5,
+                step=0.5,
+                key="cv_heading_font_size",
+            )
+
+            heading_weight_label = st.selectbox(
+                "سمك العناوين",
+                ["عادي", "Semi Bold", "Bold"],
+                index=2,
+                key="cv_heading_weight_label",
+            )
+            heading_weight = {
+                "عادي": 500,
+                "Semi Bold": 600,
+                "Bold": 700,
+            }[heading_weight_label]
+
+            heading_align_label = st.selectbox(
+                "محاذاة عناوين الأقسام",
+                ["بداية السطر", "المنتصف", "نهاية السطر"],
+                index=0,
+                key="cv_heading_align_label",
+            )
+            heading_align = {
+                "بداية السطر": "start",
+                "المنتصف": "center",
+                "نهاية السطر": "end",
+            }[heading_align_label]
+
+            contact_position_label = st.selectbox(
+                "مكان معلومات الاتصال",
+                ["حسب القالب", "أعلى الصفحة", "تحت الاسم", "Sidebar"],
+                index=0,
+                key="cv_contact_position_label",
+            )
+            contact_position = {
+                "حسب القالب": "template",
+                "أعلى الصفحة": "top",
+                "تحت الاسم": "below_name",
+                "Sidebar": "sidebar",
+            }[contact_position_label]
+
+            bullet_label = st.selectbox(
+                "شكل النقاط",
+                ["احتفظ بالأصل", "•", "-", "▪", "بدون نقاط"],
+                index=0,
+                key="cv_bullet_style_label",
+            )
+            bullet_style = {
+                "احتفظ بالأصل": "preserve",
+                "•": "•",
+                "-": "-",
+                "▪": "▪",
+                "بدون نقاط": "none",
+            }[bullet_label]
+
+            compactness = st.selectbox(
+                "كثافة التنسيق",
+                ["auto", "compact", "normal"],
+                format_func=lambda value: {
+                    "auto": "ذكي",
+                    "compact": "مضغوط",
+                    "normal": "عادي",
+                }[value],
+                index=0,
+                key="cv_compactness",
+            )
+
         photo_bytes = b""
 
         if style in ("Modern", "Template3"):
@@ -2646,6 +2887,15 @@ with st.container(key="builder"):
                 "style": style,
                 "language": language,
                 "photo": hashlib.sha256(photo_bytes).hexdigest(),
+                "page_mode": page_mode,
+                "font_family": font_family,
+                "body_font_size": body_font_size,
+                "heading_font_size": heading_font_size,
+                "heading_weight": heading_weight,
+                "heading_align": heading_align,
+                "contact_position": contact_position,
+                "bullet_style": bullet_style,
+                "compactness": compactness,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -2739,6 +2989,17 @@ with st.container(key="builder"):
                     language,
                     style,
                     photo,
+                    options={
+                        "page_mode": page_mode,
+                        "font_family": font_family,
+                        "body_font_size": body_font_size,
+                        "heading_font_size": heading_font_size,
+                        "heading_weight": heading_weight,
+                        "heading_align": heading_align,
+                        "contact_position": contact_position,
+                        "bullet_style": bullet_style,
+                        "compactness": compactness,
+                    },
                 )
 
                 pdf = render_pdf(document)
