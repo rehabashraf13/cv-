@@ -869,6 +869,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     contact_position = options.get("contact_position", "template")
     bullet_style = options.get("bullet_style", "preserve")
     compactness = options.get("compactness", "auto")
+    fit_scale = float(options.get("fit_scale", 1.0))
 
     safe_font = {
         "Arial": 'Arial, "Segoe UI", sans-serif',
@@ -1123,7 +1124,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         left: 5mm;
         width: calc(33% - 10mm);
         color: white;
-        font-size: 9.2pt;
+        font-size: __SIDE_FONT_SIZE__pt;
     }
     .sidebar .main {
         left: calc(33% + 7mm);
@@ -1154,12 +1155,12 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         gap: 8mm;
         padding-bottom: 5mm;
     }
-    .contact-list { font-size: 10pt; }
+    .contact-list { font-size: __CONTACT_FONT_SIZE__pt; }
     .identity { margin-bottom: 7mm; }
 
     h1 {
         margin: 0 0 3mm;
-        font-size: 25pt;
+        font-size: __H1_FONT_SIZE__pt;
         line-height: 1.15;
         font-weight: 800;
         overflow-wrap: anywhere;
@@ -1167,7 +1168,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     .modern h1 { color: #505050; }
     .template3 h1 { color: #1f1f1f; }
     .ats h1 { color: #000; }
-    .job-title { font-size: 12pt; margin: 0; }
+    .job-title { font-size: __JOB_TITLE_SIZE__pt; margin: 0; }
     .sidebar .identity {
         border-bottom: 1.2mm solid #193d54;
         padding-bottom: 5mm;
@@ -1219,7 +1220,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
 
     h3 {
         margin: 3mm 0 1.5mm;
-        font-size: 10.8pt;
+        font-size: __H3_FONT_SIZE__pt;
         line-height: 1.35;
         overflow-wrap: anywhere;
     }
@@ -1235,8 +1236,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     .contact { margin-bottom: 3mm; }
 
     .portrait {
-        width: 45mm;
-        height: 45mm;
+        width: __PORTRAIT_SIZE__mm;
+        height: __PORTRAIT_SIZE__mm;
         margin: 0 auto 8mm;
         border: 2mm solid #0b1520;
         border-radius: 50%;
@@ -1304,6 +1305,13 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         h2_bottom = 2.5
         h2_pad = 1.5
 
+    h1_size = max(17.0, 25.0 * fit_scale)
+    h3_size = max(8.2, 10.8 * fit_scale)
+    job_title_size = max(8.5, 12.0 * fit_scale)
+    contact_font_size = max(7.5, 10.0 * fit_scale)
+    side_font_size = max(7.4, 9.2 * fit_scale)
+    portrait_size = max(34.0, 45.0 * fit_scale)
+
     css = (
         css.replace("__FONT_FAMILY__", safe_font)
         .replace("__BODY_FONT_SIZE__", f"{body_font_size:g}")
@@ -1316,6 +1324,12 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         .replace("__H2_MARGIN_TOP__", f"{h2_top:g}")
         .replace("__H2_MARGIN_BOTTOM__", f"{h2_bottom:g}")
         .replace("__H2_PADDING_BOTTOM__", f"{h2_pad:g}")
+        .replace("__H1_FONT_SIZE__", f"{h1_size:g}")
+        .replace("__H3_FONT_SIZE__", f"{h3_size:g}")
+        .replace("__JOB_TITLE_SIZE__", f"{job_title_size:g}")
+        .replace("__CONTACT_FONT_SIZE__", f"{contact_font_size:g}")
+        .replace("__SIDE_FONT_SIZE__", f"{side_font_size:g}")
+        .replace("__PORTRAIT_SIZE__", f"{portrait_size:g}")
     )
 
     script = r"""
@@ -1560,6 +1574,98 @@ def render_pdf(document):
         raise RuntimeError("محرك التصدير لم يرجع PDF صالحًا.")
 
     return result.stdout
+
+
+
+def render_cv_with_smart_fit(
+    mapping,
+    lines,
+    language,
+    style,
+    photo,
+    options,
+    progress=None,
+):
+    """
+    Render the requested CV.
+
+    For one-page mode, progressively compress typography/layout while preserving
+    every original source line. No text is deleted, summarized, or rewritten.
+    """
+    options = dict(options or {})
+    page_mode = options.get("page_mode", "one")
+
+    if page_mode != "one":
+        document = build_html(
+            mapping,
+            lines,
+            language,
+            style,
+            photo,
+            options=options,
+        )
+        return render_pdf(document), options
+
+    requested_body = float(options.get("body_font_size", 10.0))
+    requested_heading = float(options.get("heading_font_size", 13.5))
+
+    # Start from the user's exact settings, then compress gradually.
+    # 7.5 pt is the readability floor for body text.
+    body_candidates = []
+    current = requested_body
+    while current >= 7.5:
+        body_candidates.append(round(current, 2))
+        current -= 0.5
+
+    if not body_candidates or body_candidates[-1] != 7.5:
+        body_candidates.append(7.5)
+
+    last_fit_error = None
+
+    for attempt_no, body_size in enumerate(body_candidates, start=1):
+        ratio = min(1.0, body_size / max(requested_body, 0.1))
+        attempt_options = dict(options)
+        attempt_options["body_font_size"] = body_size
+        attempt_options["heading_font_size"] = max(
+            10.5,
+            round(requested_heading * ratio, 2),
+        )
+        attempt_options["fit_scale"] = max(0.70, ratio)
+        attempt_options["compactness"] = "compact"
+
+        if progress:
+            progress(
+                f"جاري ضبط السيرة على صفحة واحدة تلقائيًا "
+                f"({attempt_no}/{len(body_candidates)})…"
+            )
+
+        document = build_html(
+            mapping,
+            lines,
+            language,
+            style,
+            photo,
+            options=attempt_options,
+        )
+
+        try:
+            return render_pdf(document), attempt_options
+
+        except RuntimeError as error:
+            message = str(error)
+            if (
+                "المحتوى أكبر من صفحة واحدة" in message
+                or "عنصر أكبر من الصفحة" in message
+            ):
+                last_fit_error = error
+                continue
+            raise
+
+    raise ValueError(
+        "المحتوى كبير جدًا ليظهر كاملًا بشكل مقروء في صفحة واحدة، "
+        "حتى بعد الضغط التلقائي. اختاري «صفحتان» أو «تلقائي». "
+        "لم يتم حذف أو اختصار أي معلومة."
+    ) from last_fit_error
 
 
 def prepare_photo(photo_bytes):
@@ -2983,29 +3089,41 @@ with st.container(key="builder"):
 
                 status.info("جاري تطبيق القالب وتجهيز ملف الـPDF…")
 
-                document = build_html(
+                render_options = {
+                    "page_mode": page_mode,
+                    "font_family": font_family,
+                    "body_font_size": body_font_size,
+                    "heading_font_size": heading_font_size,
+                    "heading_weight": heading_weight,
+                    "heading_align": heading_align,
+                    "contact_position": contact_position,
+                    "bullet_style": bullet_style,
+                    "compactness": compactness,
+                }
+
+                pdf, used_options = render_cv_with_smart_fit(
                     parsed["mapping"],
                     parsed["lines"],
                     language,
                     style,
                     photo,
-                    options={
-                        "page_mode": page_mode,
-                        "font_family": font_family,
-                        "body_font_size": body_font_size,
-                        "heading_font_size": heading_font_size,
-                        "heading_weight": heading_weight,
-                        "heading_align": heading_align,
-                        "contact_position": contact_position,
-                        "bullet_style": bullet_style,
-                        "compactness": compactness,
-                    },
+                    render_options,
+                    progress=lambda message: status.info(message),
                 )
-
-                pdf = render_pdf(document)
                 st.session_state["pdf_result"] = pdf
+                st.session_state["pdf_used_options"] = used_options
 
-                status.success("سيرتك الذاتية جاهزة. راجعيها تحت.")
+                if (
+                    page_mode == "one"
+                    and float(used_options.get("body_font_size", body_font_size))
+                    < float(body_font_size)
+                ):
+                    status.success(
+                        "تم ضغط التنسيق تلقائيًا مع الحفاظ على كل المحتوى، "
+                        "والسيرة الذاتية أصبحت صفحة واحدة."
+                    )
+                else:
+                    status.success("سيرتك الذاتية جاهزة. راجعيها تحت.")
 
             except subprocess.TimeoutExpired:
                 status.empty()
@@ -3016,7 +3134,22 @@ with st.container(key="builder"):
 
             except Exception as error:
                 status.empty()
-                st.error(safe_error(error, api_key))
+                message = safe_error(error, api_key)
+
+                if "تعذر إنشاء PDF:" in message and "Traceback" in message:
+                    # Keep infrastructure traces out of the customer-facing UI.
+                    if "المحتوى أكبر من صفحة واحدة" in message:
+                        st.error(
+                            "المحتوى كبير جدًا ليظهر كاملًا في صفحة واحدة "
+                            "بالإعدادات الحالية. جرّبي «صفحتان» أو «تلقائي»."
+                        )
+                    else:
+                        st.error(
+                            "تعذر إنشاء ملف PDF. راجعي إعدادات التصدير "
+                            "أو أعيدي المحاولة."
+                        )
+                else:
+                    st.error(message)
 
 
 # ---------------------------------------------------------
@@ -3052,7 +3185,7 @@ if pdf:
             use_container_width=True,
             key="cv_restart",
         ):
-            for key in ("parsed_cv", "pdf_result", "source_signature", "design_signature"):
+            for key in ("parsed_cv", "pdf_result", "pdf_used_options", "source_signature", "design_signature"):
                 st.session_state.pop(key, None)
             st.rerun()
 
