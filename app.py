@@ -26,22 +26,22 @@ def pdf_worker():
 
     with sync_playwright() as p:
         chromium_path = (
-    os.getenv("CHROMIUM_PATH", "").strip()
-    or shutil.which("chromium")
-    or shutil.which("chromium-browser")
-    or shutil.which("google-chrome")
-    or shutil.which("google-chrome-stable")
-)
+            os.getenv("CHROMIUM_PATH", "").strip()
+            or shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or shutil.which("google-chrome")
+            or shutil.which("google-chrome-stable")
+        )
 
-launch_kwargs = {
-    "headless": True,
-    "args": ["--no-sandbox", "--disable-dev-shm-usage"],
-}
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        }
 
-if chromium_path:
-    launch_kwargs["executable_path"] = chromium_path
+        if chromium_path:
+            launch_kwargs["executable_path"] = chromium_path
 
-browser = p.chromium.launch(**launch_kwargs)
+        browser = p.chromium.launch(**launch_kwargs)
 
         try:
             page = browser.new_page()
