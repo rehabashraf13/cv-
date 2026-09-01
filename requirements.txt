@@ -1,2 +1,6 @@
-pymupdf>=1.24
-python-docx>=1.1
+streamlit
+openai>=1.0.0
+python-dotenv
+pandas
+PyPDF2
+python-docx
