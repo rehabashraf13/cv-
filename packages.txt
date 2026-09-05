@@ -1,1 +1,3 @@
 chromium
+tesseract-ocr
+tesseract-ocr-ara
