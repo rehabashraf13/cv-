@@ -141,6 +141,9 @@ Never assign IDs from previous_context.
 Never rewrite, translate, summarize, invent, or delete source text.
 
 heading_ids are actual SECTION headings, not job or degree titles.
+If a SECTION heading wraps across two or more consecutive source lines, include ALL of those line IDs in heading_ids.
+Preserve the COMPLETE original section heading exactly; never shorten, truncate, paraphrase, or move part of it into a content group.
+Never drop any section heading that exists in the source CV.
 Bold alone does not identify a section heading.
 Group each entry with its title, organization, dates and description.
 Join wrapped lines and wrapped skill phrases.
@@ -867,7 +870,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     heading_weight = int(options.get("heading_weight", 700))
     heading_align = options.get("heading_align", "start")
     contact_position = options.get("contact_position", "template")
-    bullet_style = options.get("bullet_style", "preserve")
+    bullet_style = options.get("bullet_style", "•")
+    skills_layout = options.get("skills_layout", "inline")
     compactness = options.get("compactness", "auto")
     fit_scale = float(options.get("fit_scale", 1.0))
 
@@ -1017,10 +1021,58 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         key=lambda section: SECTION_ORDER.index(section["kind"])
     )
 
+    def split_skill_items(texts):
+        """
+        Keep the original wording, but separate common skill delimiters so the
+        renderer can choose horizontal or vertical presentation.
+        """
+        joined = " ".join(texts).strip()
+        if not joined:
+            return []
+
+        # Remove only existing visual bullet markers before re-rendering them
+        # consistently. No skill wording is rewritten.
+        parts = re.split(r"\s*(?:[•●▪]|[;,|])\s*", joined)
+        items = []
+        for item in parts:
+            item = re.sub(r"^[\-\u2022\u25cf\u25aa]\s*", "", item).strip()
+            if item:
+                items.append(item)
+
+        return items or [joined]
+
     def entry_blocks(group, kind):
         texts = [by_id[i]["text"].strip() for i in group]
 
-        if kind in {"summary", "skills", "languages"}:
+        if kind == "summary":
+            return [paragraph(" ".join(texts))]
+
+        if kind == "skills":
+            items = split_skill_items(texts)
+
+            if skills_layout == "vertical":
+                return [
+                    paragraph(
+                        bullet_style + " " + item,
+                        "skill-line bullet-line",
+                    )
+                    for item in items
+                ]
+
+            # Horizontal / side-by-side skills. Each skill still has a visible
+            # bullet so the visual treatment is consistent.
+            return [
+                '<div class="skills-inline" dir="auto">'
+                + "".join(
+                    '<span class="skill-inline-item">'
+                    + html.escape(bullet_style + " " + item)
+                    + "</span>"
+                    for item in items
+                )
+                + "</div>"
+            ]
+
+        if kind == "languages":
             return [paragraph(" ".join(texts))]
 
         blocks = [
@@ -1031,9 +1083,17 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
 
         buffer = []
 
-        def flush():
+        def flush_as_bullet():
             if buffer:
-                blocks.append(paragraph(" ".join(buffer)))
+                clean = " ".join(buffer).strip()
+                if clean:
+                    clean = re.sub(r"^[•●▪\-]\s*", "", clean)
+                    blocks.append(
+                        paragraph(
+                            bullet_style + " " + clean,
+                            "bullet-line",
+                        )
+                    )
                 buffer.clear()
 
         for index, text in enumerate(texts[1:], start=1):
@@ -1041,25 +1101,25 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             bullet = bool(bullet_match)
             bold = by_id[group[index]].get("bold", False)
 
-            if bullet or bold:
-                flush()
-
             if bullet:
-                clean_text = re.sub(r"^[•●▪\-]\s*", "", text)
-
-                if bullet_style == "preserve":
-                    rendered = text
-                elif bullet_style == "none":
-                    rendered = clean_text
-                else:
-                    rendered = bullet_style + " " + clean_text
-
-                blocks.append(paragraph(rendered, "bullet-line"))
+                flush_as_bullet()
+                clean_text = re.sub(r"^[•●▪\-]\s*", "", text).strip()
+                blocks.append(
+                    paragraph(
+                        bullet_style + " " + clean_text,
+                        "bullet-line",
+                    )
+                )
                 continue
+
+            # A bold line usually starts a new metadata/title fragment. Flush
+            # the previous descriptive text first, but keep the source text.
+            if bold:
+                flush_as_bullet()
 
             buffer.append(text)
 
-        flush()
+        flush_as_bullet()
         return blocks
 
     for section in sections:
@@ -1230,6 +1290,20 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         white-space: pre-wrap;
     }
     .bullet-line { margin-bottom: __BULLET_MARGIN__mm; }
+    .skills-inline {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1.2mm 4mm;
+        margin: 0 0 __P_MARGIN__mm;
+        align-items: baseline;
+    }
+    .skill-inline-item {
+        display: inline-block;
+        white-space: normal;
+    }
+    .skill-line {
+        margin-bottom: __BULLET_MARGIN__mm;
+    }
     .contact-top { margin-bottom: 3mm; }
     .contact-below-name { margin-bottom: 4mm; }
     .single-column { grid-template-columns: 1fr; gap: 2mm; }
@@ -2929,18 +3003,24 @@ with st.container(key="builder"):
             }[contact_position_label]
 
             bullet_label = st.selectbox(
-                "شكل النقاط",
-                ["احتفظ بالأصل", "•", "-", "▪", "بدون نقاط"],
+                "شكل النقاط · تظهر دائمًا",
+                ["•", "▪", "-"],
                 index=0,
                 key="cv_bullet_style_label",
             )
-            bullet_style = {
-                "احتفظ بالأصل": "preserve",
-                "•": "•",
-                "-": "-",
-                "▪": "▪",
-                "بدون نقاط": "none",
-            }[bullet_label]
+            bullet_style = bullet_label
+
+            skills_layout_label = st.radio(
+                "طريقة عرض المهارات",
+                ["جنب بعض", "تحت بعض"],
+                horizontal=True,
+                index=0,
+                key="cv_skills_layout_label",
+            )
+            skills_layout = {
+                "جنب بعض": "inline",
+                "تحت بعض": "vertical",
+            }[skills_layout_label]
 
             compactness = st.selectbox(
                 "كثافة التنسيق",
@@ -3001,6 +3081,7 @@ with st.container(key="builder"):
                 "heading_align": heading_align,
                 "contact_position": contact_position,
                 "bullet_style": bullet_style,
+                "skills_layout": skills_layout,
                 "compactness": compactness,
             },
             sort_keys=True,
@@ -3098,6 +3179,7 @@ with st.container(key="builder"):
                     "heading_align": heading_align,
                     "contact_position": contact_position,
                     "bullet_style": bullet_style,
+                    "skills_layout": skills_layout,
                     "compactness": compactness,
                 }
 
