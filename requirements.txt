@@ -11,3 +11,4 @@ python-docx
 python-dotenv
 Pillow
 playwright
+pytesseract
