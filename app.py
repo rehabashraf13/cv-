@@ -93,6 +93,11 @@ from docx.text.paragraph import Paragraph
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -1755,6 +1760,142 @@ def prepare_photo(photo_bytes):
         return output.getvalue()
 
 
+
+def extract_cv_text_from_image(image_bytes, language="auto"):
+    """
+    Extract CV text from an uploaded image while preserving the visual reading
+    order as closely as OCR allows. The extracted wording is not summarized,
+    translated, or rewritten.
+
+    Requires:
+      - Python package: pytesseract
+      - Tesseract OCR installed on the operating system
+      - Arabic language pack for Arabic OCR (ara)
+    """
+    if not image_bytes:
+        raise ValueError("ارفعي صورة CV أولًا.")
+
+    if pytesseract is None:
+        raise RuntimeError(
+            "ميزة قراءة الصور تحتاج مكتبة pytesseract. "
+            "ثبتيها بالأمر: pip install pytesseract"
+        )
+
+    if shutil.which("tesseract") is None:
+        # Common Windows install locations
+        possible = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+        found = next((path for path in possible if Path(path).exists()), None)
+
+        if found:
+            pytesseract.pytesseract.tesseract_cmd = found
+        else:
+            raise RuntimeError(
+                "Tesseract OCR غير مثبت أو غير موجود في PATH. "
+                "ثبتي Tesseract OCR على Windows ثم أعيدي تشغيل البرنامج."
+            )
+
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+
+        # Upscale small screenshots/scans because OCR is much more reliable
+        # around 1800–2500 px on the long edge.
+        width, height = image.size
+        longest = max(width, height)
+
+        if longest < 1800:
+            scale = min(3.0, 1800 / max(longest, 1))
+            image = image.resize(
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+
+        # Light deterministic preprocessing: grayscale + autocontrast.
+        processed = ImageOps.autocontrast(ImageOps.grayscale(image))
+
+        if language == "ar":
+            lang_candidates = ["ara+eng", "ara"]
+        elif language == "en":
+            lang_candidates = ["eng"]
+        else:
+            lang_candidates = ["ara+eng", "eng"]
+
+        last_error = None
+        data = None
+
+        for lang in lang_candidates:
+            try:
+                data = pytesseract.image_to_data(
+                    processed,
+                    lang=lang,
+                    config="--oem 3 --psm 3",
+                    output_type=pytesseract.Output.DICT,
+                )
+                break
+            except Exception as error:
+                last_error = error
+
+        if data is None:
+            raise RuntimeError(
+                "تعذر قراءة الصورة بواسطة OCR. "
+                "تأكدي من تثبيت حزمة اللغة العربية ara إذا كانت السيرة بالعربية. "
+                f"التفاصيل: {last_error}"
+            )
+
+    # Reconstruct text line-by-line from Tesseract's own page/block/paragraph
+    # ordering. This preserves the CV's reading sequence better than joining
+    # every recognized word globally.
+    lines = []
+    current_key = None
+    current_words = []
+
+    count = len(data.get("text", []))
+
+    for index in range(count):
+        word = (data["text"][index] or "").strip()
+
+        try:
+            confidence = float(data["conf"][index])
+        except (TypeError, ValueError):
+            confidence = -1
+
+        if not word or confidence < 0:
+            continue
+
+        key = (
+            int(data["page_num"][index]),
+            int(data["block_num"][index]),
+            int(data["par_num"][index]),
+            int(data["line_num"][index]),
+        )
+
+        if current_key is None:
+            current_key = key
+
+        if key != current_key:
+            if current_words:
+                lines.append(" ".join(current_words).strip())
+            current_words = []
+            current_key = key
+
+        current_words.append(word)
+
+    if current_words:
+        lines.append(" ".join(current_words).strip())
+
+    text_result = "\n".join(line for line in lines if line)
+
+    if not text_result.strip():
+        raise ValueError(
+            "لم يتم العثور على نص واضح داخل الصورة. "
+            "جربي صورة أوضح أو بدقة أعلى."
+        )
+
+    return text_result
+
+
 def safe_error(error, api_key):
     message = str(error)
 
@@ -2877,10 +3018,12 @@ with st.container(key="builder"):
     with input_col:
         mode = st.radio(
             "ابدئي بـ",
-            ["Upload a file", "Paste text"],
-            format_func=lambda value: (
-                "رفع ملف" if value == "Upload a file" else "لصق نص"
-            ),
+            ["Upload a file", "Paste text", "CV image"],
+            format_func=lambda value: {
+                "Upload a file": "رفع PDF / Word",
+                "Paste text": "لصق نص",
+                "CV image": "استخراج من صورة CV",
+            }[value],
             horizontal=True,
             key="cv_input_mode",
         )
@@ -2900,7 +3043,8 @@ with st.container(key="builder"):
             if uploaded:
                 data = uploaded.getvalue()
                 filename = uploaded.name
-        else:
+
+        elif mode == "Paste text":
             pasted = st.text_area(
                 "نص سيرتك الذاتية",
                 placeholder=(
@@ -2910,6 +3054,85 @@ with st.container(key="builder"):
                 height=230,
                 key="cv_pasted_text",
             )
+
+        else:
+            cv_image_upload = st.file_uploader(
+                "ارفعي صورة الـCV",
+                type=["png", "jpg", "jpeg", "webp"],
+                key="cv_ocr_image",
+                help="يفضل صورة واضحة ومستقيمة وعالية الدقة.",
+            )
+
+            if cv_image_upload:
+                image_bytes = cv_image_upload.getvalue()
+                image_hash = hashlib.sha256(image_bytes).hexdigest()
+
+                st.image(
+                    image_bytes,
+                    caption="صورة الـCV المرفوعة",
+                    use_container_width=True,
+                )
+
+                if (
+                    st.session_state.get("cv_ocr_image_hash")
+                    != image_hash
+                ):
+                    st.session_state["cv_ocr_image_hash"] = image_hash
+                    st.session_state.pop("cv_ocr_text", None)
+
+                extract_ocr_clicked = st.button(
+                    "🔎 استخرج النص من الصورة بالترتيب",
+                    type="secondary",
+                    use_container_width=True,
+                    key="cv_extract_ocr",
+                )
+
+                if extract_ocr_clicked:
+                    try:
+                        with st.spinner("جاري قراءة نص الـCV من الصورة…"):
+                            detected_language = st.session_state.get(
+                                "cv_language",
+                                "en",
+                            )
+                            st.session_state["cv_ocr_text"] = (
+                                extract_cv_text_from_image(
+                                    image_bytes,
+                                    detected_language,
+                                )
+                            )
+                        st.success(
+                            "تم استخراج النص. راجعيه بالأسفل قبل إنشاء الـCV."
+                        )
+                    except Exception as error:
+                        st.error(str(error))
+
+                if st.session_state.get("cv_ocr_text"):
+                    pasted = st.text_area(
+                        "النص المستخرج · بالترتيب وقابل للتعديل",
+                        value=st.session_state["cv_ocr_text"],
+                        height=420,
+                        key="cv_ocr_text_editor",
+                        help=(
+                            "راجعي الأسماء والأرقام والعناوين خصوصًا إذا كانت "
+                            "الصورة بها أعمدة أو دقتها منخفضة."
+                        ),
+                    )
+
+                    # Keep the edited version as the source of truth.
+                    st.session_state["cv_ocr_text"] = pasted
+
+                    st.download_button(
+                        "تنزيل النص المستخرج TXT",
+                        data=pasted.encode("utf-8"),
+                        file_name="cv_extracted_text.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                        key="cv_ocr_download",
+                    )
+            else:
+                st.info(
+                    "ارفعي صورة CV ثم اضغطي «استخرج النص من الصورة بالترتيب»."
+                )
 
     with preferences_col:
         st.markdown(f"**القالب:** {template_labels.get(style, style)}")
@@ -3048,8 +3271,8 @@ with st.container(key="builder"):
                 photo_bytes = photo_upload.getvalue()
 
         st.caption(
-            "المستندات الممسوحة ضوئيًا محتاجة تقنية OCR، "
-            "وهي غير متاحة في هذا الإصدار."
+            "يمكنك الآن استخراج النص من صورة CV عبر خيار "
+            "«استخراج من صورة CV». راجعي النص المستخرج قبل التصدير."
         )
 
     payload = data if pasted is None else pasted.encode("utf-8")
@@ -3119,7 +3342,7 @@ with st.container(key="builder"):
         st.session_state.pop("pdf_result", None)
 
         if not payload.strip():
-            st.error("ارفعي سيرتك الذاتية أو الصقي النص أولًا.")
+            st.error("ارفعي ملف CV أو صورة CV أو الصقي النص أولًا.")
 
         elif len(payload) > 15 * 1024 * 1024:
             st.error("من فضلك استخدمي ملف سيرة ذاتية أصغر من 15 ميجابايت.")
