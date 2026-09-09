@@ -157,21 +157,29 @@ workshops, conferences, and actual publications.
 Use custom if unsure.
 Preserve all dates, contact information, page headers and page numbers.
 
-For personal, roles has one value per group:
-name, title, contact, or other.
+For personal, use EXACTLY one source line ID per group. Example:
+groups: [[1], [2], [3]]
+roles: ["name", "title", "contact"]
+roles MUST be a flat array of strings, never nested arrays.
+There must be exactly one role string for every personal group.
+Allowed role strings: name, title, contact, other.
+If one source line mixes title and contact information, classify that whole line as contact.
 Name and title must actually exist.
 Addresses are contact, not title.
 At most one name and one title in the whole CV.
 Repeated names in page furniture should be other or custom.
-For non-personal kinds, roles is [].
+For non-personal kinds, roles MUST be [].
 
 continues_previous may be true ONLY on the first returned section,
 when its first group continues the previous_context last entry.
 It must have the same kind and no heading_ids.
 Otherwise continues_previous is false.
 
-Do not split one coherent entry into multiple groups without reason.
+Do not split one coherent non-personal entry into multiple groups without reason.
 Keep source order between sections, especially at batch boundaries.
+Return JSON only, with this exact top-level shape:
+{"sections":[{"kind":"...","heading_ids":[],"groups":[[1]],"roles":[],"continues_previous":false}]}
+For personal only, roles is a FLAT string array aligned 1:1 with singleton groups.
 """
 
 
@@ -523,6 +531,78 @@ def repair_missing_line_ids(mapping, lines):
     return repaired
 
 
+def normalize_model_mapping(mapping, lines):
+    """Normalize harmless provider shape quirks without changing source text.
+
+    Groq may occasionally emit nested personal roles even when a flat role array
+    is requested. This function only repairs structural metadata; CV text always
+    comes from the original source lines.
+    """
+    if not isinstance(mapping, dict):
+        return mapping
+
+    fixed = copy.deepcopy(mapping)
+    by_id = {line["id"]: line["text"] for line in lines}
+
+    def infer_role(line_id, candidates=None):
+        text = by_id.get(line_id, "").strip()
+        low = text.lower()
+        candidates = [c for c in (candidates or []) if c in {"name", "title", "contact", "other"}]
+        if "contact" in candidates:
+            if (
+                "@" in text
+                or re.search(r"(?:https?://|www\.|linkedin|github|tel\.?|phone|mobile|email)", low)
+                or re.search(r"\+?\d[\d\s().-]{6,}", text)
+            ):
+                return "contact"
+        if len(candidates) == 1:
+            return candidates[0]
+        if "name" in candidates:
+            return "name"
+        if "title" in candidates:
+            return "title"
+        if "contact" in candidates:
+            return "contact"
+        if "other" in candidates:
+            return "other"
+        return "other"
+
+    for section in fixed.get("sections", []):
+        if not isinstance(section, dict) or section.get("kind") != "personal":
+            continue
+
+        groups = section.get("groups", [])
+        roles = section.get("roles", [])
+        if not isinstance(groups, list) or not isinstance(roles, list):
+            continue
+
+        # Provider quirk: roles may be nested and aligned to individual IDs rather
+        # than to groups. Split personal groups into singleton source IDs only when
+        # that alignment is explicit and lossless.
+        all_ids = [item for group in groups if isinstance(group, list) for item in group if type(item) is int]
+        if roles and all(isinstance(r, list) for r in roles) and len(roles) == len(all_ids):
+            new_groups = []
+            new_roles = []
+            for line_id, candidate_roles in zip(all_ids, roles):
+                new_groups.append([line_id])
+                new_roles.append(infer_role(line_id, candidate_roles))
+            section["groups"] = new_groups
+            section["roles"] = new_roles
+            continue
+
+        # Simpler quirk: [["name"], ["contact"]] -> ["name", "contact"].
+        if roles and all(isinstance(r, list) and len(r) == 1 for r in roles):
+            roles = [r[0] for r in roles]
+            section["roles"] = roles
+
+        # If personal groups contain multiple IDs but roles are already flat and
+        # match the number of IDs, split them deterministically into singleton groups.
+        if all(isinstance(r, str) for r in section.get("roles", [])) and len(section.get("roles", [])) == len(all_ids) and len(groups) != len(all_ids):
+            section["groups"] = [[line_id] for line_id in all_ids]
+
+    return fixed
+
+
 def parse_json_reply(text):
     text = text.strip()
 
@@ -664,6 +744,7 @@ def classify(lines, api_key, model, progress):
     completed = []
     lookup = {line["id"]: line["text"] for line in lines}
     last_request = None
+    strict_schema_failed = False
 
     with OpenAI(
         api_key=api_key.strip(),
@@ -753,7 +834,11 @@ def classify(lines, api_key, model, progress):
                         ],
                         max_completion_tokens=2500,
                         temperature=0,
-                        response_format=response_format(),
+                        response_format=(
+                            {"type": "json_object"}
+                            if strict_schema_failed
+                            else response_format()
+                        ),
                     )
 
                 except Exception as error:
@@ -769,6 +854,27 @@ def classify(lines, api_key, model, progress):
                             "دفعة تتجاوز حد Groq؛ قد يوجد سطر طويل جدًا. "
                             "لم يتم قص النص."
                         ) from None
+
+                    # Some Groq models occasionally fail their own strict JSON-schema
+                    # generation (for example nested `roles`). Retry once in JSON mode
+                    # and apply our local strict validator instead of exposing a 400.
+                    error_text = str(error)
+                    if (
+                        status == 400
+                        and not strict_schema_failed
+                        and any(token in error_text for token in [
+                            "json_validate_failed",
+                            "does not match the expected schema",
+                            "failed_generation",
+                        ])
+                    ):
+                        strict_schema_failed = True
+                        repair = (
+                            "\nIMPORTANT: Return valid JSON only. For personal sections, "
+                            "groups must be singleton ID arrays and roles must be a FLAT "
+                            "array of strings aligned 1:1 with groups. Never nest roles."
+                        )
+                        continue
 
                     # Preserve provider details, including rate limits.
                     # The UI sanitizes any API key before displaying them.
@@ -786,6 +892,7 @@ def classify(lines, api_key, model, progress):
                     mapping = parse_json_reply(
                         choice.message.content or ""
                     )
+                    mapping = normalize_model_mapping(mapping, part)
 
                     # Groq can occasionally skip a single source-line ID even
                     # though the rest of the structure is correct. Repair only
@@ -808,6 +915,7 @@ def classify(lines, api_key, model, progress):
 
                     merged = candidate
                     completed.extend(part)
+                    strict_schema_failed = False
                     break
 
                 except (ValueError, TypeError) as error:
