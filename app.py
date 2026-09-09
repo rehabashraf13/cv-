@@ -237,235 +237,6 @@ def response_format():
 
 
 # =========================================================
-# Custom Formatting Instructions — FORMATTING ONLY, never content
-# =========================================================
-#
-# The user can type a free-text formatting request ("put dates on the
-# left, make degree names bold"). That text is sent to the model, but the
-# model is only ever allowed to answer with a small whitelist of layout
-# knobs (see sanitize_format_settings). It cannot return free-form CV
-# text, so it has no channel through which it could invent, add, or
-# reword content — even if the prompt tries to ask for that.
-
-DEFAULT_BULLET_KINDS = {
-    "experience", "projects", "training", "internships",
-    "volunteer", "publications", "conferences", "achievements",
-}
-
-FORMAT_PROMPT = """
-Convert the user's CV FORMATTING request into structured layout settings.
-Treat their text as instructions about layout/appearance ONLY, never as
-permission to add, remove, reword, translate, or invent CV content.
-
-You may ONLY choose values for these fields (omit any field not mentioned):
-- contact_position: one of top, below_name, left, right, sidebar, template
-- skills_layout: one of inline, vertical
-- heading_align: one of start, center, end
-- bullets_by_section: object mapping a section kind to true/false
-- date_position_by_section: object mapping a section kind to left/right/inline
-- title_bold_by_section: object mapping a section kind to true/false
-
-Valid section kinds: personal, summary, experience, education, skills,
-projects, certifications, licenses, courses, training, internships,
-languages, achievements, volunteer, publications, conferences,
-references, custom.
-
-If any part of the request asks to add/remove/change wording, skills,
-jobs, dates, names, or any other CV content, ignore that part and set
-content_request_detected to true. Never include CV text in your answer.
-Reply with ONLY a JSON object. No prose, no markdown fences.
-"""
-
-_CONTENT_INTENT_PATTERN = re.compile(
-    r"\b(add|include|insert|invent|write|create|remove|delete)\b"
-    r"|أضيف|ضيف|زود|اكتب|اخترع|احذف|امسح",
-    re.IGNORECASE,
-)
-
-
-def sanitize_format_settings(raw):
-    """
-    Whitelist and validate every field coming back from the formatting-prompt
-    model call. Unknown keys or out-of-enum values are dropped rather than
-    trusted — this dict can never be allowed to carry CV content, only
-    layout choices, so anything that doesn't match the fixed shape below is
-    simply discarded.
-    """
-    if not isinstance(raw, dict):
-        return {}
-
-    clean = {}
-    kind_enum = set(LABELS)
-
-    def enum_value(key, allowed):
-        value = raw.get(key)
-        if isinstance(value, str) and value in allowed:
-            clean[key] = value
-
-    enum_value(
-        "contact_position",
-        {"top", "below_name", "left", "right", "sidebar", "template"},
-    )
-    enum_value("skills_layout", {"inline", "vertical"})
-    enum_value("heading_align", {"start", "center", "end"})
-
-    bullets = raw.get("bullets_by_section")
-    if isinstance(bullets, dict):
-        clean["bullets_by_section"] = {
-            k: bool(v) for k, v in bullets.items()
-            if k in kind_enum and isinstance(v, bool)
-        }
-
-    dates = raw.get("date_position_by_section")
-    if isinstance(dates, dict):
-        clean["date_position_by_section"] = {
-            k: v for k, v in dates.items()
-            if k in kind_enum and v in {"left", "right", "inline"}
-        }
-
-    title_bold = raw.get("title_bold_by_section")
-    if isinstance(title_bold, dict):
-        clean["title_bold_by_section"] = {
-            k: bool(v) for k, v in title_bold.items()
-            if k in kind_enum and isinstance(v, bool)
-        }
-
-    return clean
-
-
-def parse_custom_formatting_prompt(instructions, api_key, model):
-    """
-    Turn a free-text formatting request into a whitelisted settings dict.
-    Returns (settings, content_request_detected). Never raises for a bad or
-    empty prompt — formatting mode should degrade to "no change" rather than
-    block PDF generation.
-    """
-    instructions = (instructions or "").strip()
-    if not instructions:
-        return {}, False
-
-    content_hint = bool(_CONTENT_INTENT_PATTERN.search(instructions))
-
-    if not api_key.strip() or model not in MODELS:
-        return {}, content_hint
-
-    try:
-        with OpenAI(
-            api_key=api_key.strip(),
-            base_url="https://api.groq.com/openai/v1",
-            timeout=60,
-            max_retries=0,
-        ) as client:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": FORMAT_PROMPT},
-                    {"role": "user", "content": instructions},
-                ],
-            )
-
-        raw = parse_json_reply(response.choices[0].message.content)
-    except Exception:
-        # A failed formatting-prompt call must never block rendering; fall
-        # back to "no AI-derived formatting settings" and keep going with
-        # whatever manual settings and content-intent heuristic we have.
-        return {}, content_hint
-
-    settings = sanitize_format_settings(raw)
-    detected = content_hint or bool(
-        isinstance(raw, dict) and raw.get("content_request_detected")
-    )
-    return settings, detected
-
-
-# =========================================================
-# Heuristic date-in-line detection (formatting only)
-# =========================================================
-#
-# The data model keeps each CV entry as original source lines (no separate
-# "date" field is extracted by the classifier — see requirement 19: avoid a
-# bigger schema than necessary). To support per-section date placement
-# without inventing or guessing dates, this looks for a date-shaped
-# substring already sitting at the very start or end of an existing line.
-# If nothing confidently date-shaped is found there, the line is left
-# completely untouched and rendered inline as before.
-
-_DATE_TOKEN = (
-    r"(?:\d{4}\s*[-–—]\s*(?:present|current|now|حتى\s*الآن|الآن|\d{4})"
-    r"|\d{1,2}/\d{4}\s*[-–—]\s*(?:present|current|\d{1,2}/\d{4})"
-    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*\d{4}"
-    r"\s*[-–—]\s*(?:present|current|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*\d{4})?"
-    r"|present|current|حتى\s*الآن"
-    r"|\d{4})"
-)
-_DATE_LINE_PATTERN = re.compile(_DATE_TOKEN, re.IGNORECASE)
-
-
-def extract_edge_date(text):
-    """
-    Return (rest, date) if a date-shaped token sits at the very start or end
-    of `text`, else None. Never modifies the wording itself — only splits an
-    existing line into two existing pieces.
-    """
-    text = text.strip()
-    if not text:
-        return None
-
-    for match in _DATE_LINE_PATTERN.finditer(text):
-        start, end = match.span()
-        at_start = start == 0
-        at_end = end == len(text)
-
-        if not (at_start or at_end):
-            continue
-
-        date_text = match.group(0).strip()
-        rest = (text[:start] + text[end:]).strip(" -–—|,\u2022\u25cf\u25aa")
-
-        if not rest:
-            continue
-
-        return rest, date_text
-
-    return None
-
-
-def apply_bold_terms(text, terms):
-    """
-    Wrap exact, pre-existing substrings in <strong>. Only ever restyles text
-    that is already there — never adds, removes, or rewords anything.
-    """
-    if not terms:
-        return html.escape(text)
-
-    unique_terms = sorted(
-        {term.strip() for term in terms if term and term.strip()},
-        key=len,
-        reverse=True,
-    )
-    if not unique_terms:
-        return html.escape(text)
-
-    pattern = re.compile(
-        "(" + "|".join(re.escape(term) for term in unique_terms) + ")",
-        re.IGNORECASE,
-    )
-
-    pieces = pattern.split(text)
-    rendered = []
-    for piece in pieces:
-        if not piece:
-            continue
-        if pattern.fullmatch(piece):
-            rendered.append("<strong>" + html.escape(piece) + "</strong>")
-        else:
-            rendered.append(html.escape(piece))
-    return "".join(rendered)
-
-
-# =========================================================
 # Extract PDF / DOCX / pasted text
 # =========================================================
 
@@ -745,29 +516,9 @@ def repair_missing_line_ids(mapping, lines):
             group.sort(key=lambda value: expected_order.index(value))
             continue
 
-        # Extremely unusual fallback: preserve the source line in Additional
-        # Information rather than dropping it or blocking PDF generation.
-        custom = next(
-            (
-                section for section in sections
-                if isinstance(section, dict)
-                and section.get("kind") == "custom"
-                and not section.get("heading_ids")
-            ),
-            None,
-        )
-
-        if custom is None:
-            custom = {
-                "kind": "custom",
-                "heading_ids": [],
-                "groups": [],
-                "roles": [],
-                "continues_previous": False,
-            }
-            sections.append(custom)
-
-        custom["groups"].append([missing_id])
+        # No safe deterministic target exists. Do not invent a section; leave the
+        # ID missing so strict validation reports the problem and rendering stops.
+        continue
 
     return repaired
 
@@ -1077,6 +828,39 @@ def classify(lines, api_key, model, progress):
     return mapping, validate_mapping(mapping, lines)
 
 
+
+def interpret_formatting_instructions(text):
+    """Deterministically extract safe formatting wishes; reject content edits."""
+    raw = (text or "").strip()
+    settings = {}
+    warnings = []
+    if not raw:
+        return settings, warnings
+    low = raw.lower()
+    content_verbs = ["add ", "create ", "write ", "rewrite", "improve", "summar", "invent", "أضف", "اضف", "اكتب", "أنشئ", "انشئ", "حسن", "لخص"]
+    if any(v in low for v in content_verbs):
+        warnings.append("تم تجاهل أي جزء يطلب إضافة/حذف/إعادة كتابة محتوى؛ هذا الحقل للتنسيق فقط.")
+    if ("skill" in low or "مهار" in low) and any(v in low for v in ["vertical", "each", "separate line", "تحت بعض", "كل مهارة", "سطر"]):
+        settings["skills_layout"] = "vertical"
+    elif ("skill" in low or "مهار" in low) and any(v in low for v in ["inline", "side by side", "جنب بعض"]):
+        settings["skills_layout"] = "inline"
+    if any(v in low for v in ["contact below", "below the name", "تحت الاسم"]): settings["contact_position"] = "below_name"
+    if any(v in low for v in ["contact above", "above the name", "فوق الاسم", "أعلى الاسم"]): settings["contact_position"] = "top"
+    if any(v in low for v in ["contact left", "left of the name", "يسار الاسم"]): settings["contact_position"] = "left_name"
+    if any(v in low for v in ["contact right", "right of the name", "يمين الاسم"]): settings["contact_position"] = "right_name"
+    return settings, warnings
+
+
+def normalized_content_snapshot(mapping, lines):
+    """Formatting-independent integrity snapshot of authorized CV source data."""
+    validate_mapping(mapping, lines)
+    by_id = {line["id"]: re.sub(r"\s+", " ", line["text"].strip()) for line in lines}
+    ids=[]
+    for section in mapping["sections"]:
+        ids.extend(section.get("heading_ids", []))
+        for group in section.get("groups", []): ids.extend(group)
+    return [by_id[i] for i in ids]
+
 # =========================================================
 # Templates
 # =========================================================
@@ -1108,6 +892,10 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     skills_layout = options.get("skills_layout", "inline")
     compactness = options.get("compactness", "auto")
     fit_scale = float(options.get("fit_scale", 1.0))
+    section_bullets = options.get("section_bullets", {}) or {}
+    date_positions = options.get("date_positions", {}) or {}
+    bold_fields = options.get("bold_fields", {}) or {}
+    custom_bold_text = [str(x).strip() for x in (options.get("custom_bold_text", []) or []) if str(x).strip()]
 
     safe_font = {
         "Arial": 'Arial, "Segoe UI", sans-serif',
@@ -1225,13 +1013,14 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                 )
             else:
                 main_blocks.append(
-                    '<div class="contact-list contact-below-name">' + contact_html + "</div>"
+                    '<div class="contact-inline contact-below-name">' + '<span class="sep">|</span>'.join('<span dir="auto">' + html.escape(value) + '</span>' for value in details) + "</div>"
                 )
 
     elif name or title or details:
-        contact_html = "".join(
-            paragraph(value, "contact") for value in details
-        )
+        contact_html = "".join(paragraph(value, "contact") for value in details)
+        inline_contact_html = '<div class="contact-inline">' + '<span class="sep">|</span>'.join(
+            '<span dir="auto">' + html.escape(value) + '</span>' for value in details
+        ) + '</div>'
 
         if contact_position == "top" and details:
             main_blocks.append(
@@ -1239,11 +1028,13 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             )
             main_blocks.append(identity)
         elif contact_position == "below_name" and details:
-            main_blocks.append(
-                '<div class="classic-header single-column">'
-                + identity
-                + '<div class="contact-list">' + contact_html + "</div></div>"
-            )
+            main_blocks.append('<div class="classic-header single-column">' + identity + inline_contact_html + "</div>")
+        elif contact_position in {"left_name", "right_name"} and details:
+            left = '<div class="contact-list">' + contact_html + '</div>'
+            right = identity
+            if contact_position == "right_name":
+                left, right = right, left
+            main_blocks.append('<div class="header-side">' + left + right + '</div>')
         else:
             main_blocks.append(
                 '<div class="classic-header">'
@@ -1251,9 +1042,16 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                 + '<div class="contact-list">' + contact_html + "</div></div>"
             )
 
-    sections.sort(
-        key=lambda section: SECTION_ORDER.index(section["kind"])
-    )
+    # Preserve source section order by default. Reordering is formatting-only and
+    # is applied only when the user explicitly supplies section_order.
+    requested_order = options.get("section_order") or []
+    if requested_order:
+        rank = {kind: i for i, kind in enumerate(requested_order)}
+        sections = sorted(
+            enumerate(sections),
+            key=lambda pair: (rank.get(pair[1]["kind"], len(rank) + pair[0]), pair[0]),
+        )
+        sections = [section for _, section in sections]
 
     def split_skill_items(texts):
         """
@@ -1275,85 +1073,101 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
 
         return items or [joined]
 
+    DATE_RE = re.compile(r"(?i)(?:\b(?:19|20)\d{2}\b(?:\s*[-–—/]\s*(?:present|current|now|(?:19|20)\d{2}))?|\b(?:present|current|now)\b|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)\s+\d{4})")
+
+    def style_existing_text(text, kind, index=0):
+        """Style existing source text only; never rewrite or generate CV wording."""
+        configured = bold_fields.get(kind, [])
+        if isinstance(configured, str):
+            configured = [configured]
+
+        # Section-level field controls intentionally bold only the first source
+        # line of an entry (degree/job/training title), leaving the rest normal.
+        if index == 0 and any(
+            value in {
+                "title", "degree", "certificate", "job_title",
+                "training_title", "department"
+            }
+            for value in configured
+        ):
+            return f"<strong>{html.escape(text)}</strong>"
+
+        # Custom bold accepts existing full sentences OR existing substrings.
+        # The text itself is never changed: only matching source characters are
+        # wrapped in <strong>. Longer matches are applied first.
+        matches = [value for value in custom_bold_text if value and value in text]
+        if not matches:
+            return html.escape(text)
+
+        matches = sorted(set(matches), key=len, reverse=True)
+        pattern = re.compile("|".join(re.escape(value) for value in matches))
+        pieces = []
+        cursor = 0
+        for match in pattern.finditer(text):
+            pieces.append(html.escape(text[cursor:match.start()]))
+            pieces.append("<strong>" + html.escape(match.group(0)) + "</strong>")
+            cursor = match.end()
+        pieces.append(html.escape(text[cursor:]))
+        return "".join(pieces)
+
+    def paragraph_html(text, class_name="", kind=None, index=0):
+        body = style_existing_text(text, kind, index) if kind else html.escape(text)
+        return f'<p class="{class_name}" dir="auto">{body}</p>'
+
     def entry_blocks(group, kind):
         texts = [by_id[i]["text"].strip() for i in group]
 
         if kind == "summary":
-            return [paragraph(" ".join(texts))]
+            return [paragraph_html(" ".join(texts), kind=kind)]
 
         if kind == "skills":
             items = split_skill_items(texts)
-
+            use_bullets = bool(section_bullets.get(kind, False))
+            prefix = (bullet_style + " ") if use_bullets else ""
             if skills_layout == "vertical":
-                return [
-                    paragraph(
-                        bullet_style + " " + item,
-                        "skill-line bullet-line",
-                    )
-                    for item in items
-                ]
-
-            # Horizontal / side-by-side skills. Each skill still has a visible
-            # bullet so the visual treatment is consistent.
+                return [paragraph_html(prefix + item, "skill-line" + (" bullet-line" if use_bullets else ""), kind, i) for i, item in enumerate(items)]
+            skill_parts = [
+                '<span class="skill-inline-item">'
+                + style_existing_text(prefix + item, kind, i)
+                + "</span>"
+                for i, item in enumerate(items)
+            ]
             return [
                 '<div class="skills-inline" dir="auto">'
-                + "".join(
-                    '<span class="skill-inline-item">'
-                    + html.escape(bullet_style + " " + item)
-                    + "</span>"
-                    for item in items
-                )
+                + '<span class="skill-separator" aria-hidden="true">|</span>'.join(skill_parts)
                 + "</div>"
             ]
 
         if kind == "languages":
-            return [paragraph(" ".join(texts))]
+            return [paragraph_html(" ".join(texts), kind=kind)]
 
-        blocks = [
-            '<h3 dir="auto">'
-            + html.escape(texts[0])
-            + "</h3>"
-        ]
-
-        buffer = []
-
-        def flush_as_bullet():
-            if buffer:
-                clean = " ".join(buffer).strip()
-                if clean:
-                    clean = re.sub(r"^[•●▪\-]\s*", "", clean)
-                    blocks.append(
-                        paragraph(
-                            bullet_style + " " + clean,
-                            "bullet-line",
-                        )
-                    )
-                buffer.clear()
-
-        for index, text in enumerate(texts[1:], start=1):
-            bullet_match = re.match(r"^([•●▪\-])\s*", text)
-            bullet = bool(bullet_match)
-            bold = by_id[group[index]].get("bold", False)
-
-            if bullet:
-                flush_as_bullet()
-                clean_text = re.sub(r"^[•●▪\-]\s*", "", text).strip()
+        use_bullets = bool(section_bullets.get(kind, False))
+        date_position = date_positions.get(kind, "inline")
+        blocks = []
+        for index, text in enumerate(texts):
+            cls = "entry-line"
+            prefix = ""
+            if index > 0 and use_bullets:
+                prefix = bullet_style + " "
+                cls += " bullet-line"
+            rendered = prefix + text
+            date_match = DATE_RE.search(text)
+            if date_match and date_position in {"left", "right"}:
+                date_text = date_match.group(0)
+                remaining = (
+                    text[:date_match.start()] + text[date_match.end():]
+                ).strip(" -–—|,")
+                date_html = html.escape(date_text)
+                remaining_html = style_existing_text(remaining, kind, index)
+                if prefix:
+                    remaining_html = html.escape(prefix) + remaining_html
                 blocks.append(
-                    paragraph(
-                        bullet_style + " " + clean_text,
-                        "bullet-line",
-                    )
+                    f'<div class="entry-date-row date-{date_position}" dir="auto">'
+                    f'<span class="entry-date">{date_html}</span>'
+                    f'<span class="entry-primary">{remaining_html}</span></div>'
                 )
                 continue
-
-            # A bold line usually starts a new metadata/title fragment. Flush
-            # the previous descriptive text first, but keep the source text.
-            if bold:
-                flush_as_bullet()
-
-            buffer.append(text)
-
-        flush_as_bullet()
+            blocks.append(paragraph_html(rendered, cls, kind, index))
         return blocks
 
     for section in sections:
@@ -1365,15 +1179,9 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             else main_blocks
         )
 
-        heading = (
-            original(section["heading_ids"])
-            if section["heading_ids"]
-            else LABELS[kind][1 if arabic else 0]
-        )
-
-        target.append(
-            '<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>"
-        )
+        heading = original(section["heading_ids"]) if section["heading_ids"] else ""
+        if heading:
+            target.append('<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>")
 
         for group in section["groups"]:
             target.extend(entry_blocks(group, kind))
@@ -1535,6 +1343,12 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         display: inline-block;
         white-space: normal;
     }
+    .skill-separator {
+        display: inline-block;
+        margin: 0 2.2mm;
+        opacity: .65;
+        font-weight: 400;
+    }
     .skill-line {
         margin-bottom: __BULLET_MARGIN__mm;
     }
@@ -1542,6 +1356,16 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     .contact-below-name { margin-bottom: 4mm; }
     .single-column { grid-template-columns: 1fr; gap: 2mm; }
     .contact { margin-bottom: 3mm; }
+    .contact-inline { display:flex; flex-wrap:wrap; gap:1.5mm 3mm; align-items:center; margin-bottom:4mm; }
+    .contact-inline .sep { opacity:.55; }
+    .header-side { display:grid; grid-template-columns: 1fr 1fr; gap:7mm; align-items:start; }
+    .entry-date-row { display:flex; gap:4mm; align-items:baseline; margin-bottom: __P_MARGIN__mm; }
+    .entry-date-row.date-left .entry-date { order:0; }
+    .entry-date-row.date-left .entry-primary { order:1; flex:1; }
+    .entry-date-row.date-right .entry-primary { order:0; flex:1; }
+    .entry-date-row.date-right .entry-date { order:1; }
+    .entry-date { white-space:nowrap; }
+    h2, .entry-date-row { break-inside: avoid; }
 
     .portrait {
         width: __PORTRAIT_SIZE__mm;
@@ -1649,9 +1473,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             await document.fonts.ready;
 
             const hasSide = document.body.classList.contains("sidebar");
-            const forcedOne = document.body.classList.contains("fit-one");
-            const forcedTwo = document.body.classList.contains("fit-two");
-            const maxPages = forcedOne ? 1 : (forcedTwo ? 2 : null);
+            // Never force content into a fixed page count. Every generated sheet is A4.
+            const maxPages = null;
             const pages = [];
             const root = document.getElementById("pages");
 
@@ -1659,9 +1482,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                 while (pages.length <= index) {
                     if (maxPages !== null && index >= maxPages) {
                         throw new Error(
-                            forcedOne
-                                ? "المحتوى أكبر من صفحة واحدة بالإعدادات الحالية. قللي حجم الخط أو اختاري صفحتين."
-                                : "المحتوى أكبر من صفحتين بالإعدادات الحالية."
+                            "المحتوى يحتاج صفحات إضافية."
                         );
                     }
 
@@ -1809,12 +1630,6 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                 await flow("side-source", "side");
             }
 
-            pages.forEach((sheet, index) => {
-                const footer = document.createElement("div");
-                footer.className = "page-number";
-                footer.textContent = `${index + 1} / ${pages.length}`;
-                sheet.appendChild(footer);
-            });
 
         } catch (error) {
             window.layoutError = String(error.message || error);
@@ -1835,8 +1650,6 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         style_class
         + (" sidebar" if has_side else "")
         + (" rtl" if arabic else "")
-        + (" fit-one" if page_mode == "one" else "")
-        + (" fit-two" if page_mode == "two" else "")
     )
 
     return (
@@ -1886,94 +1699,15 @@ def render_pdf(document):
 
 
 def render_cv_with_smart_fit(
-    mapping,
-    lines,
-    language,
-    style,
-    photo,
-    options,
-    progress=None,
+    mapping, lines, language, style, photo, options, progress=None,
 ):
-    """
-    Render the requested CV.
-
-    For one-page mode, progressively compress typography/layout while preserving
-    every original source line. No text is deleted, summarized, or rewritten.
-    """
+    """Render naturally across true A4 pages without deleting or shrinking content."""
     options = dict(options or {})
-    page_mode = options.get("page_mode", "one")
-
-    if page_mode != "one":
-        document = build_html(
-            mapping,
-            lines,
-            language,
-            style,
-            photo,
-            options=options,
-        )
-        return render_pdf(document), options
-
-    requested_body = float(options.get("body_font_size", 10.0))
-    requested_heading = float(options.get("heading_font_size", 13.5))
-
-    # Start from the user's exact settings, then compress gradually.
-    # 7.5 pt is the readability floor for body text.
-    body_candidates = []
-    current = requested_body
-    while current >= 7.5:
-        body_candidates.append(round(current, 2))
-        current -= 0.5
-
-    if not body_candidates or body_candidates[-1] != 7.5:
-        body_candidates.append(7.5)
-
-    last_fit_error = None
-
-    for attempt_no, body_size in enumerate(body_candidates, start=1):
-        ratio = min(1.0, body_size / max(requested_body, 0.1))
-        attempt_options = dict(options)
-        attempt_options["body_font_size"] = body_size
-        attempt_options["heading_font_size"] = max(
-            10.5,
-            round(requested_heading * ratio, 2),
-        )
-        attempt_options["fit_scale"] = max(0.70, ratio)
-        attempt_options["compactness"] = "compact"
-
-        if progress:
-            progress(
-                f"جاري ضبط السيرة على صفحة واحدة تلقائيًا "
-                f"({attempt_no}/{len(body_candidates)})…"
-            )
-
-        document = build_html(
-            mapping,
-            lines,
-            language,
-            style,
-            photo,
-            options=attempt_options,
-        )
-
-        try:
-            return render_pdf(document), attempt_options
-
-        except RuntimeError as error:
-            message = str(error)
-            if (
-                "المحتوى أكبر من صفحة واحدة" in message
-                or "عنصر أكبر من الصفحة" in message
-            ):
-                last_fit_error = error
-                continue
-            raise
-
-    raise ValueError(
-        "المحتوى كبير جدًا ليظهر كاملًا بشكل مقروء في صفحة واحدة، "
-        "حتى بعد الضغط التلقائي. اختاري «صفحتان» أو «تلقائي». "
-        "لم يتم حذف أو اختصار أي معلومة."
-    ) from last_fit_error
+    # one/two are retained for backward-compatible UI state, but are treated as
+    # preferences only. Content preservation wins and pagination remains automatic.
+    options["page_mode"] = "auto"
+    document = build_html(mapping, lines, language, style, photo, options=options)
+    return render_pdf(document), options
 
 
 def prepare_photo(photo_bytes):
@@ -2257,7 +1991,17 @@ html {
 
 [data-testid="stTextInput"] input,
 [data-testid="stTextArea"] textarea {
-    color: #153e31;
+    background: #ffffff !important;
+    color: #111111 !important;
+    -webkit-text-fill-color: #111111 !important;
+    caret-color: #111111 !important;
+}
+
+[data-testid="stTextInput"] input::placeholder,
+[data-testid="stTextArea"] textarea::placeholder {
+    color: #6b7280 !important;
+    -webkit-text-fill-color: #6b7280 !important;
+    opacity: 1 !important;
 }
 
 [data-testid="stExpander"] {
@@ -3380,6 +3124,13 @@ with st.container(key="builder"):
         )
 
         with st.expander("تخصيص التنسيق", expanded=True):
+            custom_formatting_instructions = st.text_area(
+                "Custom Formatting Instructions",
+                key="cv_custom_formatting_instructions",
+                placeholder="مثال: Put Education dates on the left. Make degree names bold. Keep skills vertical.",
+                help="للتنسيق فقط. أي طلب لإضافة أو إعادة كتابة محتوى سيتم تجاهله.",
+            )
+
             page_mode = st.radio(
                 "عدد الصفحات",
                 ["one", "two", "auto"],
@@ -3443,7 +3194,7 @@ with st.container(key="builder"):
 
             contact_position_label = st.selectbox(
                 "مكان معلومات الاتصال",
-                ["حسب القالب", "أعلى الصفحة", "تحت الاسم", "Sidebar"],
+                ["حسب القالب", "أعلى الصفحة", "تحت الاسم", "يسار الاسم", "يمين الاسم", "Sidebar"],
                 index=0,
                 key="cv_contact_position_label",
             )
@@ -3451,11 +3202,13 @@ with st.container(key="builder"):
                 "حسب القالب": "template",
                 "أعلى الصفحة": "top",
                 "تحت الاسم": "below_name",
+                "يسار الاسم": "left_name",
+                "يمين الاسم": "right_name",
                 "Sidebar": "sidebar",
             }[contact_position_label]
 
             bullet_label = st.selectbox(
-                "شكل النقاط · تظهر دائمًا",
+                "شكل النقاط للأقسام التي تختارينها",
                 ["•", "▪", "-"],
                 index=0,
                 key="cv_bullet_style_label",
@@ -3473,6 +3226,59 @@ with st.container(key="builder"):
                 "جنب بعض": "inline",
                 "تحت بعض": "vertical",
             }[skills_layout_label]
+
+            # Manual UI controls always override Custom Formatting Instructions.
+            manual_override_skills = True
+            manual_override_contact = True
+            st.caption("الاختيارات اليدوية هنا لها أولوية أعلى من الـ Custom Formatting Instructions.")
+
+            parsed_for_controls = st.session_state.get("parsed_cv")
+            present_kinds = []
+            if parsed_for_controls:
+                present_kinds = [s["kind"] for s in parsed_for_controls["mapping"]["sections"] if s["kind"] != "personal"]
+            section_bullets = {}
+            date_positions = {}
+            bold_fields = {}
+            if present_kinds:
+                st.markdown("**إعدادات كل قسم**")
+                # The user decides exactly which EXISTING sections receive bullets.
+                # Nothing is selected automatically.
+                bullet_kinds = st.multiselect(
+                    "اختاري الأقسام التي تريدين لها نقاطًا",
+                    present_kinds,
+                    default=[],
+                    format_func=lambda k: LABELS.get(k, (k, k))[1 if language == "ar" else 0],
+                    key="cv_bullet_sections",
+                    help="تظهر هنا الأقسام الموجودة فعلًا في السيرة فقط.",
+                )
+                section_bullets = {k: (k in bullet_kinds) for k in present_kinds}
+                st.caption("يمكنك تحديد مكان التاريخ بشكل مستقل لكل قسم موجود. إذا لم يوجد تاريخ في القسم فلن يتغير شيء.")
+                for k in present_kinds:
+                    if k not in {"summary", "skills", "languages", "references"}:
+                        pos = st.selectbox(
+                            f"مكان التاريخ — {LABELS.get(k,(k,k))[1 if language == 'ar' else 0]}",
+                            ["inline", "left", "right"],
+                            format_func=lambda value: {
+                                "inline": "داخل السطر",
+                                "left": "يسار",
+                                "right": "يمين",
+                            }[value],
+                            key=f"cv_date_{k}",
+                        )
+                        date_positions[k] = pos
+                bold_degree = st.checkbox("اجعل اسم الدرجة/الشهادة في التعليم Bold", key="cv_bold_degree")
+                bold_job = st.checkbox("اجعل Job/Training Title Bold", key="cv_bold_job")
+                if bold_degree: bold_fields["education"] = ["degree"]
+                if bold_job:
+                    bold_fields["experience"] = ["job_title"]
+                    bold_fields["training"] = ["training_title"]
+            custom_bold_raw = st.text_input(
+                "حددي النص أو الجمل الموجودة التي تريدين جعلها Bold",
+                key="cv_custom_bold_text",
+                placeholder="مثال: Registered Nurse | Emergency Department",
+                help="افصلي بين أكثر من نص بعلامة |. لن تتم إضافة أي نص جديد؛ يتم تنسيق النص الموجود فقط.",
+            )
+            custom_bold_text = [x.strip() for x in custom_bold_raw.split("|") if x.strip()]
 
             compactness = st.selectbox(
                 "كثافة التنسيق",
@@ -3535,6 +3341,13 @@ with st.container(key="builder"):
                 "bullet_style": bullet_style,
                 "skills_layout": skills_layout,
                 "compactness": compactness,
+                "custom_formatting_instructions": custom_formatting_instructions,
+                "section_bullets": section_bullets,
+                "date_positions": date_positions,
+                "bold_fields": bold_fields,
+                "custom_bold_text": custom_bold_text,
+                "manual_override_skills": manual_override_skills,
+                "manual_override_contact": manual_override_contact,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -3622,6 +3435,10 @@ with st.container(key="builder"):
 
                 status.info("جاري تطبيق القالب وتجهيز ملف الـPDF…")
 
+                prompt_settings, prompt_warnings = interpret_formatting_instructions(custom_formatting_instructions)
+                for warning in prompt_warnings:
+                    st.warning(warning)
+
                 render_options = {
                     "page_mode": page_mode,
                     "font_family": font_family,
@@ -3633,8 +3450,18 @@ with st.container(key="builder"):
                     "bullet_style": bullet_style,
                     "skills_layout": skills_layout,
                     "compactness": compactness,
+                    "section_bullets": section_bullets,
+                    "date_positions": date_positions,
+                    "bold_fields": bold_fields,
+                    "custom_bold_text": custom_bold_text,
                 }
+                # Custom prompt changes formatting only. Explicit manual override toggles win.
+                if "skills_layout" in prompt_settings and not manual_override_skills:
+                    render_options["skills_layout"] = prompt_settings["skills_layout"]
+                if "contact_position" in prompt_settings and not manual_override_contact:
+                    render_options["contact_position"] = prompt_settings["contact_position"]
 
+                before_snapshot = normalized_content_snapshot(parsed["mapping"], parsed["lines"])
                 pdf, used_options = render_cv_with_smart_fit(
                     parsed["mapping"],
                     parsed["lines"],
@@ -3644,20 +3471,16 @@ with st.container(key="builder"):
                     render_options,
                     progress=lambda message: status.info(message),
                 )
+                after_snapshot = normalized_content_snapshot(parsed["mapping"], parsed["lines"])
+                if before_snapshot != after_snapshot:
+                    raise ValueError("Integrity check failed: CV content changed during formatting. PDF was not accepted.")
                 st.session_state["pdf_result"] = pdf
                 st.session_state["pdf_used_options"] = used_options
 
-                if (
-                    page_mode == "one"
-                    and float(used_options.get("body_font_size", body_font_size))
-                    < float(body_font_size)
-                ):
-                    status.success(
-                        "تم ضغط التنسيق تلقائيًا مع الحفاظ على كل المحتوى، "
-                        "والسيرة الذاتية أصبحت صفحة واحدة."
-                    )
-                else:
-                    status.success("سيرتك الذاتية جاهزة. راجعيها تحت.")
+                status.success(
+                    "سيرتك الذاتية جاهزة. كل صفحة محفوظة بمقاس A4، "
+                    "وإذا زاد المحتوى ينتقل تلقائيًا لصفحة A4 جديدة دون حذف النص."
+                )
 
             except subprocess.TimeoutExpired:
                 status.empty()
