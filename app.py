@@ -1321,15 +1321,21 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             # Inline means truly one inline flow with a visible separator between
             # every skill. Do not add bullets here; the separator is the visual
             # delimiter requested by the user.
-            skill_parts = [
-                '<span class="skill-inline-item">'
-                + style_existing_text(item, kind, i)
-                + "</span>"
-                for i, item in enumerate(items)
-            ]
+            # Put the separator inside the HTML of every item except the last.
+            # This is more reliable in Playwright/PDF pagination than a separate
+            # separator node, which can be dropped/reflowed by the page splitter.
+            skill_parts = []
+            for i, item in enumerate(items):
+                separator = ' <span class="skill-separator" aria-hidden="true">|</span> ' if i < len(items) - 1 else ''
+                skill_parts.append(
+                    '<span class="skill-inline-item">'
+                    + style_existing_text(item, kind, i)
+                    + separator
+                    + "</span>"
+                )
             return [
                 '<div class="skills-inline" dir="auto">'
-                + '<span class="skill-separator" aria-hidden="true"> | </span>'.join(skill_parts)
+                + "".join(skill_parts)
                 + "</div>"
             ]
 
@@ -1565,9 +1571,11 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     }
     .skill-separator {
         display: inline;
-        white-space: pre;
-        opacity: .72;
-        padding: 0 .8mm;
+        white-space: nowrap;
+        opacity: 1;
+        padding: 0 1.2mm;
+        font-weight: 400;
+        color: currentColor;
         font-weight: 400;
     }
     .skill-line {
