@@ -1076,6 +1076,28 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     def original(ids):
         return " ".join(by_id[i]["text"].strip() for i in ids)
 
+    def normalize_heading_label(value):
+        return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+    def is_skill_like_section(kind, heading):
+        """Detect skill sections by semantic heading aliases, not only parser kind."""
+        if kind == "skills":
+            return True
+        label = normalize_heading_label(heading)
+        if not label:
+            return False
+        aliases = (
+            "skill", "skills", "professional skills", "personal skills",
+            "technical skills", "soft skills", "hard skills", "key skills",
+            "core skills", "core competencies", "competencies", "competency",
+            "technical competencies", "professional competencies",
+            "technical expertise", "expertise", "proficiencies", "proficiency",
+            "capabilities", "abilities", "strengths",
+            "مهارات", "المهارات", "المهارات المهنية", "المهارات الشخصية",
+            "المهارات التقنية", "الكفاءات", "الكفاءات المهنية", "القدرات",
+        )
+        return any(alias in label for alias in aliases)
+
     def paragraph(text, class_name=""):
         return (
             f'<p class="{class_name}" dir="auto">'
@@ -1272,27 +1294,42 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         body = style_existing_text(text, kind, index) if kind else html.escape(text)
         return f'<p class="{class_name}" dir="auto">{body}</p>'
 
-    def entry_blocks(group, kind, section_key=None):
+    def entry_blocks(group, kind, section_key=None, skill_like=False):
         texts = [by_id[i]["text"].strip() for i in group]
 
         if kind == "summary":
             return [paragraph_html(" ".join(texts), kind=kind)]
 
-        if kind == "skills":
+        # A section can be a skills section even when the parser classified it as
+        # custom/other. Heading aliases such as PROFESSIONAL SKILLS, PERSONAL
+        # SKILLS, CORE COMPETENCIES, TECHNICAL EXPERTISE, etc. are all handled.
+        if skill_like:
             items = split_skill_items(texts)
             use_bullets = bool(section_bullets.get(section_key, section_bullets.get(kind, False)))
-            prefix = (bullet_style + " ") if use_bullets else ""
             if skills_layout == "vertical":
-                return [paragraph_html(prefix + item, "skill-line" + (" bullet-line" if use_bullets else ""), kind, i) for i, item in enumerate(items)]
+                prefix = (bullet_style + " ") if use_bullets else ""
+                return [
+                    paragraph_html(
+                        prefix + item,
+                        "skill-line" + (" bullet-line" if use_bullets else ""),
+                        kind,
+                        i,
+                    )
+                    for i, item in enumerate(items)
+                ]
+
+            # Inline means truly one inline flow with a visible separator between
+            # every skill. Do not add bullets here; the separator is the visual
+            # delimiter requested by the user.
             skill_parts = [
                 '<span class="skill-inline-item">'
-                + style_existing_text(prefix + item, kind, i)
+                + style_existing_text(item, kind, i)
                 + "</span>"
                 for i, item in enumerate(items)
             ]
             return [
                 '<div class="skills-inline" dir="auto">'
-                + '<span class="skill-separator" aria-hidden="true">|</span>'.join(skill_parts)
+                + '<span class="skill-separator" aria-hidden="true"> | </span>'.join(skill_parts)
                 + "</div>"
             ]
 
@@ -1300,12 +1337,16 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             return [paragraph_html(" ".join(texts), kind=kind)]
 
         use_bullets = bool(section_bullets.get(section_key, section_bullets.get(kind, False)))
-        date_position = date_positions.get(kind, "inline")
+        date_position = date_positions.get(section_key, date_positions.get(kind, "inline"))
         blocks = []
         for index, text in enumerate(texts):
             cls = "entry-line"
             prefix = ""
-            if index > 0 and use_bullets:
+            # If the selected section has a one-line entry, that line itself must
+            # receive the bullet. For multi-line entries, keep the first line as
+            # the title/header and bullet the following descriptive lines.
+            should_bullet = use_bullets and (len(texts) == 1 or index > 0)
+            if should_bullet:
                 prefix = bullet_style + " "
                 cls += " bullet-line"
             rendered = prefix + text
@@ -1331,19 +1372,20 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     for section_index, section in enumerate(sections):
         kind = section["kind"]
         section_key = f"{kind}__{section_index}"
+        heading = original(section["heading_ids"]) if section["heading_ids"] else ""
+        skill_like = is_skill_like_section(kind, heading)
 
         target = (
             side_blocks
-            if has_side and kind in {"education", "skills", "languages"}
+            if has_side and (kind in {"education", "languages"} or skill_like)
             else main_blocks
         )
 
-        heading = original(section["heading_ids"]) if section["heading_ids"] else ""
         if heading:
             target.append('<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>")
 
         for group in section["groups"]:
-            target.extend(entry_blocks(group, kind, section_key))
+            target.extend(entry_blocks(group, kind, section_key, skill_like=skill_like))
 
     css = """
     @page { size: A4; margin: 0; }
@@ -1492,15 +1534,19 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     }
     .bullet-line { margin-bottom: __BULLET_MARGIN__mm; }
     .skills-inline {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 1.2mm 4mm;
+        display: block;
         margin: 0 0 __P_MARGIN__mm;
-        align-items: baseline;
+        line-height: 1.55;
     }
     .skill-inline-item {
-        display: inline-block;
-        white-space: normal;
+        display: inline;
+        white-space: nowrap;
+    }
+    .skill-separator {
+        display: inline;
+        white-space: pre;
+        opacity: .72;
+        padding: 0 .8mm;
     }
     .skill-sep { display:inline-block; margin:0 2.2mm; opacity:.65; }
     .skill-separator {
@@ -3377,7 +3423,7 @@ with st.container(key="builder"):
             bullet_style = bullet_label
 
             skills_layout_label = st.radio(
-                "طريقة عرض المهارات",
+                "طريقة عرض أقسام المهارات (Skills / Professional Skills / Personal Skills / Competencies / Expertise...)",
                 ["جنب بعض", "تحت بعض"],
                 horizontal=True,
                 index=0,
@@ -3439,20 +3485,27 @@ with st.container(key="builder"):
                     help="كل CV يعرض أقسامه الفعلية فقط، حتى لو كان فيه أقسام مخصصة أو أسماء مختلفة.",
                 )
                 section_bullets = {key: (key in bullet_kinds) for key in present_section_options}
-                st.caption("يمكنك تحديد مكان التاريخ بشكل مستقل لكل نوع قسم موجود. إذا لم يوجد تاريخ في القسم فلن يتغير شيء.")
-                for k in present_kinds:
-                    if k not in {"summary", "skills", "languages", "references"}:
+                st.caption("يمكنك تحديد مكان التاريخ بشكل مستقل لكل قسم موجود في هذه السيرة. إذا لم يوجد تاريخ في القسم فلن يتغير شيء.")
+                for section_key in present_section_options:
+                    k = present_section_kind[section_key]
+                    label = present_section_labels.get(section_key, k)
+                    label_low = label.lower()
+                    skill_like_ui = any(token in label_low for token in [
+                        "skill", "competenc", "expertise", "proficien", "capabilit",
+                        "abilit", "strength", "مهار", "كفاء", "قدرات"
+                    ])
+                    if k not in {"summary", "languages", "references"} and not skill_like_ui:
                         pos = st.selectbox(
-                            f"مكان التاريخ — {LABELS.get(k,(k,k))[1 if language == 'ar' else 0]}",
+                            f"مكان التاريخ — {label}",
                             ["inline", "left", "right"],
                             format_func=lambda value: {
                                 "inline": "داخل السطر",
                                 "left": "يسار",
                                 "right": "يمين",
                             }[value],
-                            key=f"cv_date_{k}",
+                            key=f"cv_date_{section_key}",
                         )
-                        date_positions[k] = pos
+                        date_positions[section_key] = pos
                 bold_degree = st.checkbox("اجعل اسم الدرجة/الشهادة في التعليم Bold", key="cv_bold_degree")
                 bold_job = st.checkbox("اجعل Job/Training Title Bold", key="cv_bold_job")
                 if bold_degree: bold_fields["education"] = ["degree"]
@@ -3645,8 +3698,13 @@ with st.container(key="builder"):
                 # Date prompt may fill only an untouched/default Inline position.
                 prompt_dates = prompt_settings.get("date_positions_prompt", {})
                 for _k, _v in prompt_dates.items():
-                    if _k in date_positions and date_positions.get(_k, "inline") == "inline":
-                        date_positions[_k] = _v
+                    for _section_key, _section_kind in present_section_kind.items():
+                        if (
+                            _section_kind == _k
+                            and _section_key in date_positions
+                            and date_positions.get(_section_key, "inline") == "inline"
+                        ):
+                            date_positions[_section_key] = _v
 
                 for warning in prompt_warnings:
                     st.warning(warning)
