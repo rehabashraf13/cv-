@@ -1384,8 +1384,29 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         if heading:
             target.append('<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>")
 
-        for group in section["groups"]:
-            target.extend(entry_blocks(group, kind, section_key, skill_like=skill_like))
+        if skill_like:
+            # Render the whole skills section as ONE block. The parser often stores
+            # each skill in a separate group; rendering each group independently
+            # creates one row per skill even when the user selects inline. Flattening
+            # the existing source IDs changes formatting only and preserves every
+            # original skill text exactly.
+            merged_skill_group = [
+                item_id
+                for group in section["groups"]
+                for item_id in group
+            ]
+            if merged_skill_group:
+                target.extend(
+                    entry_blocks(
+                        merged_skill_group,
+                        kind,
+                        section_key,
+                        skill_like=True,
+                    )
+                )
+        else:
+            for group in section["groups"]:
+                target.extend(entry_blocks(group, kind, section_key, skill_like=False))
 
     css = """
     @page { size: A4; margin: 0; }
@@ -1547,12 +1568,6 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         white-space: pre;
         opacity: .72;
         padding: 0 .8mm;
-    }
-    .skill-sep { display:inline-block; margin:0 2.2mm; opacity:.65; }
-    .skill-separator {
-        display: inline-block;
-        margin: 0 2.2mm;
-        opacity: .65;
         font-weight: 400;
     }
     .skill-line {
