@@ -1048,6 +1048,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     contact_position = options.get("contact_position", "template")
     bullet_style = options.get("bullet_style", "•")
     skills_layout = options.get("skills_layout", "inline")
+    skills_separator = str(options.get("skills_separator", "|") or "|")
     compactness = options.get("compactness", "auto")
     fit_scale = float(options.get("fit_scale", 1.0))
     section_bullets = options.get("section_bullets", {}) or {}
@@ -1318,24 +1319,21 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                     for i, item in enumerate(items)
                 ]
 
-            # Inline means truly one inline flow with a visible separator between
-            # every skill. Do not add bullets here; the separator is the visual
-            # delimiter requested by the user.
-            # Put the separator inside the HTML of every item except the last.
-            # This is more reliable in Playwright/PDF pagination than a separate
-            # separator node, which can be dropped/reflowed by the page splitter.
-            skill_parts = []
-            for i, item in enumerate(items):
-                separator = ' <span class="skill-separator" aria-hidden="true">|</span> ' if i < len(items) - 1 else ''
-                skill_parts.append(
-                    '<span class="skill-inline-item">'
-                    + style_existing_text(item, kind, i)
-                    + separator
-                    + "</span>"
-                )
+            # Inline skills are rendered as ONE continuous HTML flow and the
+            # selected separator is inserted as literal visible text between
+            # every two skills. This avoids separator nodes being lost during
+            # browser/PDF pagination or HTML reflow.
+            safe_separator = html.escape(skills_separator)
+            skill_parts = [
+                '<span class="skill-inline-item">'
+                + style_existing_text(item, kind, i)
+                + "</span>"
+                for i, item in enumerate(items)
+            ]
+            joined_skills = (f' <span class="skill-separator">{safe_separator}</span> ').join(skill_parts)
             return [
                 '<div class="skills-inline" dir="auto">'
-                + "".join(skill_parts)
+                + joined_skills
                 + "</div>"
             ]
 
@@ -3457,6 +3455,34 @@ with st.container(key="builder"):
                 "تحت بعض": "vertical",
             }[skills_layout_label]
 
+            if skills_layout == "inline":
+                skills_separator_label = st.selectbox(
+                    "شكل الفاصل بين كل مهارة والتانية",
+                    [
+                        "|  خط رأسي",
+                        "•  نقطة",
+                        "—  شرطة طويلة",
+                        "/  شرطة مائلة",
+                        ",  فاصلة",
+                    ],
+                    index=0,
+                    key="cv_skills_separator_label",
+                )
+                skills_separator = {
+                    "|  خط رأسي": "|",
+                    "•  نقطة": "•",
+                    "—  شرطة طويلة": "—",
+                    "/  شرطة مائلة": "/",
+                    ",  فاصلة": ",",
+                }[skills_separator_label]
+                st.caption(
+                    f"مثال: Python {skills_separator} SQL {skills_separator} Power BI {skills_separator} Excel"
+                )
+            else:
+                # Kept in state/signature for deterministic rendering even though
+                # separators are only used by the inline layout.
+                skills_separator = "|"
+
             # Manual UI controls always override Custom Formatting Instructions.
             manual_override_skills = True
             manual_override_contact = True
@@ -3603,6 +3629,7 @@ with st.container(key="builder"):
                 "contact_position": contact_position,
                 "bullet_style": bullet_style,
                 "skills_layout": skills_layout,
+                "skills_separator": skills_separator,
                 "compactness": compactness,
                 "custom_formatting_instructions": custom_formatting_instructions,
                 "section_bullets": section_bullets,
@@ -3742,6 +3769,7 @@ with st.container(key="builder"):
                     "contact_position": contact_position,
                     "bullet_style": bullet_style,
                     "skills_layout": skills_layout,
+                    "skills_separator": skills_separator,
                     "compactness": compactness,
                     "section_bullets": section_bullets,
                     "date_positions": date_positions,
