@@ -948,14 +948,64 @@ def interpret_formatting_instructions(text):
     content_verbs = ["add ", "create ", "write ", "rewrite", "improve", "summar", "invent", "أضف", "اضف", "اكتب", "أنشئ", "انشئ", "حسن", "لخص"]
     if any(v in low for v in content_verbs):
         warnings.append("تم تجاهل أي جزء يطلب إضافة/حذف/إعادة كتابة محتوى؛ هذا الحقل للتنسيق فقط.")
+
     if ("skill" in low or "مهار" in low) and any(v in low for v in ["vertical", "each", "separate line", "تحت بعض", "كل مهارة", "سطر"]):
         settings["skills_layout"] = "vertical"
-    elif ("skill" in low or "مهار" in low) and any(v in low for v in ["inline", "side by side", "جنب بعض"]):
+    elif ("skill" in low or "مهار" in low) and any(v in low for v in ["inline", "side by side", "جنب بعض", "بجانب بعض"]):
         settings["skills_layout"] = "inline"
+
     if any(v in low for v in ["contact below", "below the name", "تحت الاسم"]): settings["contact_position"] = "below_name"
     if any(v in low for v in ["contact above", "above the name", "فوق الاسم", "أعلى الاسم"]): settings["contact_position"] = "top"
     if any(v in low for v in ["contact left", "left of the name", "يسار الاسم"]): settings["contact_position"] = "left_name"
     if any(v in low for v in ["contact right", "right of the name", "يمين الاسم"]): settings["contact_position"] = "right_name"
+
+    # Safe per-section bullet instructions
+    section_aliases = {
+        "summary": ["summary", "professional summary", "الملخص", "الملخص المهني"],
+        "experience": ["experience", "work experience", "الخبرات", "الخبرة"],
+        "education": ["education", "التعليم"],
+        "skills": ["skills", "professional skills", "personal skills", "المهارات"],
+        "projects": ["projects", "المشروعات", "المشاريع"],
+        "certifications": ["certifications", "certificates", "الشهادات"],
+        "licenses": ["licenses", "licensure", "professional licensure", "التراخيص", "الترخيص"],
+        "courses": ["courses", "الدورات"],
+        "training": ["training", "clinical training", "additional clinical training", "التدريب", "التدريب السريري"],
+        "internships": ["internship", "internships", "التدريب العملي"],
+        "languages": ["languages", "اللغات"],
+        "achievements": ["achievements", "الإنجازات"],
+        "volunteer": ["volunteer", "volunteering", "التطوع", "العمل التطوعي"],
+        "publications": ["publications", "الأبحاث المنشورة"],
+        "conferences": ["conferences", "workshops", "المؤتمرات", "ورش العمل"],
+        "references": ["references", "المراجع"],
+        "custom": ["additional information", "other", "custom", "معلومات إضافية"]
+    }
+
+    bullet_trigger = any(v in low for v in ["bullet", "bullet points", "نقاط", "بنقاط", "نقطة"] )
+    if bullet_trigger:
+        chosen = []
+        for kind, aliases in section_aliases.items():
+            if any(alias in low for alias in aliases):
+                chosen.append(kind)
+        if chosen:
+            settings["section_bullets_prompt"] = {k: True for k in chosen}
+
+    # Safe per-section date-position instructions
+    date_positions = {}
+    for kind, aliases in section_aliases.items():
+        hit = next((a for a in aliases if a in low), None)
+        if not hit:
+            continue
+        nearby = low[max(0, low.find(hit)-120): low.find(hit)+len(hit)+180]
+        if any(v in nearby for v in ["date", "dates", "تاريخ", "تواريخ"]):
+            if any(v in nearby for v in ["left", "on the left", "يسار", "على اليسار"]):
+                date_positions[kind] = "left"
+            elif any(v in nearby for v in ["right", "on the right", "يمين", "على اليمين"]):
+                date_positions[kind] = "right"
+            elif any(v in nearby for v in ["inline", "same line", "داخل السطر", "نفس السطر"]):
+                date_positions[kind] = "inline"
+    if date_positions:
+        settings["date_positions_prompt"] = date_positions
+
     return settings, warnings
 
 
@@ -1222,7 +1272,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         body = style_existing_text(text, kind, index) if kind else html.escape(text)
         return f'<p class="{class_name}" dir="auto">{body}</p>'
 
-    def entry_blocks(group, kind):
+    def entry_blocks(group, kind, section_key=None):
         texts = [by_id[i]["text"].strip() for i in group]
 
         if kind == "summary":
@@ -1230,7 +1280,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
 
         if kind == "skills":
             items = split_skill_items(texts)
-            use_bullets = bool(section_bullets.get(kind, False))
+            use_bullets = bool(section_bullets.get(section_key, section_bullets.get(kind, False)))
             prefix = (bullet_style + " ") if use_bullets else ""
             if skills_layout == "vertical":
                 return [paragraph_html(prefix + item, "skill-line" + (" bullet-line" if use_bullets else ""), kind, i) for i, item in enumerate(items)]
@@ -1249,7 +1299,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         if kind == "languages":
             return [paragraph_html(" ".join(texts), kind=kind)]
 
-        use_bullets = bool(section_bullets.get(kind, False))
+        use_bullets = bool(section_bullets.get(section_key, section_bullets.get(kind, False)))
         date_position = date_positions.get(kind, "inline")
         blocks = []
         for index, text in enumerate(texts):
@@ -1278,8 +1328,9 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             blocks.append(paragraph_html(rendered, cls, kind, index))
         return blocks
 
-    for section in sections:
+    for section_index, section in enumerate(sections):
         kind = section["kind"]
+        section_key = f"{kind}__{section_index}"
 
         target = (
             side_blocks
@@ -1292,7 +1343,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             target.append('<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>")
 
         for group in section["groups"]:
-            target.extend(entry_blocks(group, kind))
+            target.extend(entry_blocks(group, kind, section_key))
 
     css = """
     @page { size: A4; margin: 0; }
@@ -1451,6 +1502,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         display: inline-block;
         white-space: normal;
     }
+    .skill-sep { display:inline-block; margin:0 2.2mm; opacity:.65; }
     .skill-separator {
         display: inline-block;
         margin: 0 2.2mm;
@@ -1467,12 +1519,13 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     .contact-inline { display:flex; flex-wrap:wrap; gap:1.5mm 3mm; align-items:center; margin-bottom:4mm; }
     .contact-inline .sep { opacity:.55; }
     .header-side { display:grid; grid-template-columns: 1fr 1fr; gap:7mm; align-items:start; }
-    .entry-date-row { display:flex; gap:4mm; align-items:baseline; margin-bottom: __P_MARGIN__mm; }
-    .entry-date-row.date-left .entry-date { order:0; }
-    .entry-date-row.date-left .entry-primary { order:1; flex:1; }
-    .entry-date-row.date-right .entry-primary { order:0; flex:1; }
-    .entry-date-row.date-right .entry-date { order:1; }
-    .entry-date { white-space:nowrap; }
+    .entry-date-row { display:grid; grid-template-columns: 31mm minmax(0,1fr); column-gap: 8mm; align-items:baseline; margin-bottom: __P_MARGIN__mm; width:100%; }
+    .entry-date-row.date-left .entry-date { grid-column:1; justify-self:start; }
+    .entry-date-row.date-left .entry-primary { grid-column:2; }
+    .entry-date-row.date-right { grid-template-columns:minmax(0,1fr) 31mm; }
+    .entry-date-row.date-right .entry-primary { grid-column:1; }
+    .entry-date-row.date-right .entry-date { grid-column:2; justify-self:end; }
+    .entry-date { white-space:nowrap; font-weight:400; }
     h2, .entry-date-row { break-inside: avoid; }
 
     .portrait {
@@ -3342,25 +3395,51 @@ with st.container(key="builder"):
 
             parsed_for_controls = st.session_state.get("parsed_cv")
             present_kinds = []
+            present_section_options = []
+            present_section_labels = {}
+            present_section_kind = {}
             if parsed_for_controls:
-                present_kinds = [s["kind"] for s in parsed_for_controls["mapping"]["sections"] if s["kind"] != "personal"]
+                _lines_lookup = {line["id"]: line["text"].strip() for line in parsed_for_controls["lines"]}
+                _seen_labels = {}
+                _non_personal_index = 0
+                for _section in parsed_for_controls["mapping"]["sections"]:
+                    if _section["kind"] == "personal":
+                        continue
+                    _kind = _section["kind"]
+                    if _kind not in present_kinds:
+                        present_kinds.append(_kind)
+                    _key = f"{_kind}__{_non_personal_index}"
+                    _non_personal_index += 1
+                    _heading_ids = _section.get("heading_ids", [])
+                    if _heading_ids:
+                        _label = " ".join(_lines_lookup.get(i, "") for i in _heading_ids).strip()
+                    else:
+                        _label = LABELS.get(_kind, (_kind, _kind))[1 if language == "ar" else 0]
+                    if not _label:
+                        _label = _kind
+                    _seen_labels[_label] = _seen_labels.get(_label, 0) + 1
+                    if _seen_labels[_label] > 1:
+                        _label = f"{_label} ({_seen_labels[_label]})"
+                    present_section_options.append(_key)
+                    present_section_labels[_key] = _label
+                    present_section_kind[_key] = _kind
             section_bullets = {}
             date_positions = {}
             bold_fields = {}
-            if present_kinds:
+            bullet_kinds = []
+            if present_section_options:
                 st.markdown("**إعدادات كل قسم**")
-                # The user decides exactly which EXISTING sections receive bullets.
-                # Nothing is selected automatically.
+                st.caption("الأقسام التالية مأخوذة من هذه السيرة نفسها. اختاري فقط الأقسام التي تريدين أن يظهر محتواها بنقاط.")
                 bullet_kinds = st.multiselect(
-                    "اختاري الأقسام التي تريدين لها نقاطًا",
-                    present_kinds,
+                    "الأقسام التي تريدين لها نقاطًا",
+                    present_section_options,
                     default=[],
-                    format_func=lambda k: LABELS.get(k, (k, k))[1 if language == "ar" else 0],
+                    format_func=lambda key: present_section_labels.get(key, key),
                     key="cv_bullet_sections",
-                    help="تظهر هنا الأقسام الموجودة فعلًا في السيرة فقط.",
+                    help="كل CV يعرض أقسامه الفعلية فقط، حتى لو كان فيه أقسام مخصصة أو أسماء مختلفة.",
                 )
-                section_bullets = {k: (k in bullet_kinds) for k in present_kinds}
-                st.caption("يمكنك تحديد مكان التاريخ بشكل مستقل لكل قسم موجود. إذا لم يوجد تاريخ في القسم فلن يتغير شيء.")
+                section_bullets = {key: (key in bullet_kinds) for key in present_section_options}
+                st.caption("يمكنك تحديد مكان التاريخ بشكل مستقل لكل نوع قسم موجود. إذا لم يوجد تاريخ في القسم فلن يتغير شيء.")
                 for k in present_kinds:
                     if k not in {"summary", "skills", "languages", "references"}:
                         pos = st.selectbox(
@@ -3472,12 +3551,17 @@ with st.container(key="builder"):
 
     if st.session_state.get("parsed_cv"):
         st.success(
-            "محتواكِ جاهز. غيّري القالب وأنشئي ملف PDF آخر "
-            "من غير ما نعيد التحليل."
+            "تم تحليل السيرة. اختاري الآن الأقسام التي تريدين لها نقاطًا، "
+            "واضبطي مكان التواريخ وباقي التنسيق، ثم اضغطي «أنشئي سيرتي الذاتية»."
         )
 
+    create_button_label = (
+        "أنشئي سيرتي الذاتية  ←"
+        if st.session_state.get("parsed_cv")
+        else "حللي السيرة واعرضي الأقسام  ←"
+    )
     create_clicked = st.button(
-        "أنشئي سيرتي الذاتية  ←",
+        create_button_label,
         type="primary",
         use_container_width=True,
         key="cv_create",
@@ -3540,10 +3624,30 @@ with st.container(key="builder"):
                     }
 
                     st.session_state["parsed_cv"] = parsed
+                    # First pass only analyzes the CV. Rerun so the UI can show
+                    # the exact sections found in THIS CV before PDF generation.
+                    st.rerun()
 
                 status.info("جاري تطبيق القالب وتجهيز ملف الـPDF…")
 
                 prompt_settings, prompt_warnings = interpret_formatting_instructions(custom_formatting_instructions)
+
+                # Manual controls override Custom Formatting Instructions.
+                # If the user did not choose bullet sections manually, allow the prompt
+                # to select only sections that already exist in the parsed CV.
+                prompt_bullets = prompt_settings.get("section_bullets_prompt", {})
+                if not bullet_kinds:
+                    for _kind, _value in prompt_bullets.items():
+                        for _section_key, _section_kind in present_section_kind.items():
+                            if _section_kind == _kind and _section_key in section_bullets:
+                                section_bullets[_section_key] = bool(_value)
+
+                # Date prompt may fill only an untouched/default Inline position.
+                prompt_dates = prompt_settings.get("date_positions_prompt", {})
+                for _k, _v in prompt_dates.items():
+                    if _k in date_positions and date_positions.get(_k, "inline") == "inline":
+                        date_positions[_k] = _v
+
                 for warning in prompt_warnings:
                     st.warning(warning)
 
