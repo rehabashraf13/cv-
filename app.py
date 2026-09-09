@@ -1389,24 +1389,51 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             target.append('<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>")
 
         if skill_like:
-            # Render the whole skills section as ONE block. The parser often stores
-            # each skill in a separate group; rendering each group independently
-            # creates one row per skill even when the user selects inline. Flattening
-            # the existing source IDs changes formatting only and preserves every
-            # original skill text exactly.
-            merged_skill_group = [
-                item_id
-                for group in section["groups"]
-                for item_id in group
-            ]
-            if merged_skill_group:
+            # IMPORTANT: preserve parser group boundaries as skill boundaries.
+            # The parser commonly stores one skill per group. Previously all IDs
+            # were flattened first, then split_skill_items() joined them with spaces;
+            # that turned the whole section into ONE item, so no separator could be
+            # inserted. Build the list from each source group instead.
+            skill_items = []
+            for group in section["groups"]:
+                group_texts = [by_id[i]["text"].strip() for i in group]
+                # If a source group itself contains explicit delimiters, preserve the
+                # wording and split only on those existing visual delimiters.
+                group_items = split_skill_items(group_texts)
+                if len(group_items) == 1 and len(group_texts) > 1:
+                    # Multiple source lines inside one group are distinct visible
+                    # skill lines unless the source itself joined them with a delimiter.
+                    group_items = [t for t in group_texts if t]
+                skill_items.extend(item for item in group_items if item)
+
+            use_bullets = bool(
+                section_bullets.get(section_key, section_bullets.get(kind, False))
+            )
+
+            if skills_layout == "vertical":
+                prefix = (bullet_style + " ") if use_bullets else ""
                 target.extend(
-                    entry_blocks(
-                        merged_skill_group,
+                    paragraph_html(
+                        prefix + item,
+                        "skill-line" + (" bullet-line" if use_bullets else ""),
                         kind,
-                        section_key,
-                        skill_like=True,
+                        i,
                     )
+                    for i, item in enumerate(skill_items)
+                )
+            elif skill_items:
+                # Create ONE literal text flow. The separator is inserted into the
+                # text between every two skills, not as a standalone HTML node.
+                # This guarantees it survives Chromium layout/PDF generation.
+                styled_items = [
+                    style_existing_text(item, kind, i)
+                    for i, item in enumerate(skill_items)
+                ]
+                separator_html = " " + html.escape(skills_separator) + " "
+                target.append(
+                    '<div class="skills-inline" dir="auto">'
+                    + separator_html.join(styled_items)
+                    + "</div>"
                 )
         else:
             for group in section["groups"]:
