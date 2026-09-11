@@ -1719,6 +1719,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         .replace("__PORTRAIT_SIZE__", f"{portrait_size:g}")
     )
 
+    max_pages_js = "1" if page_mode == "one" else ("2" if page_mode == "two" else "null")
+
     script = r"""
     window.layoutDone = false;
     window.layoutError = null;
@@ -1728,8 +1730,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             await document.fonts.ready;
 
             const hasSide = document.body.classList.contains("sidebar");
-            // Never force content into a fixed page count. Every generated sheet is A4.
-            const maxPages = null;
+            // Respect the user-selected page count. A4 dimensions never change.
+            const maxPages = __MAX_PAGES__;
             const pages = [];
             const root = document.getElementById("pages");
 
@@ -1894,6 +1896,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     })();
     """
 
+    script = script.replace("__MAX_PAGES__", max_pages_js)
+
     style_class = {
         "Classic": "classic",
         "Modern": "modern",
@@ -1956,14 +1960,65 @@ def render_pdf(document):
 def render_cv_with_smart_fit(
     mapping, lines, language, style, photo, options, progress=None,
 ):
-    """Render naturally across true A4 pages without deleting or shrinking content."""
-    options = dict(options or {})
-    # one/two are retained for backward-compatible UI state, but are treated as
-    # preferences only. Content preservation wins and pagination remains automatic.
-    options["page_mode"] = "auto"
-    document = build_html(mapping, lines, language, style, photo, options=options)
-    return render_pdf(document), options
+    """Render using the requested A4 page count without deleting CV content.
 
+    For one-page mode we progressively tighten spacing and font sizes within
+    readable limits. If the unchanged content still cannot fit on one A4 page,
+    rendering stops with a clear message instead of silently creating page 2.
+    """
+    base = dict(options or {})
+    requested_mode = base.get("page_mode", "auto")
+
+    # Auto and two-page modes do not need one-page fitting attempts.
+    if requested_mode != "one":
+        document = build_html(mapping, lines, language, style, photo, options=base)
+        return render_pdf(document), base
+
+    original_body = float(base.get("body_font_size", 10.0))
+    original_heading = float(base.get("heading_font_size", 13.5))
+
+    # Keep A4 physical dimensions fixed. Only normal typography/spacing is
+    # compacted; content is never removed, summarized, or rewritten.
+    attempts = [
+        (1.00, original_body, original_heading, "compact"),
+        (0.96, max(9.5, original_body - 0.5), max(12.5, original_heading - 0.5), "compact"),
+        (0.92, max(9.0, original_body - 1.0), max(12.0, original_heading - 1.0), "compact"),
+        (0.88, max(8.5, original_body - 1.5), max(11.5, original_heading - 1.5), "compact"),
+        (0.84, max(8.0, original_body - 2.0), max(11.0, original_heading - 2.0), "compact"),
+    ]
+
+    last_error = None
+    for number, (scale, body_size, heading_size, compactness) in enumerate(attempts, start=1):
+        current = dict(base)
+        current["page_mode"] = "one"
+        current["fit_scale"] = scale
+        current["body_font_size"] = body_size
+        current["heading_font_size"] = heading_size
+        current["compactness"] = compactness
+
+        if progress:
+            progress(f"محاولة ضبط السيرة في صفحة A4 واحدة — {number}/{len(attempts)}")
+
+        try:
+            document = build_html(mapping, lines, language, style, photo, options=current)
+            pdf = render_pdf(document)
+            return pdf, current
+        except Exception as error:
+            last_error = error
+            message = str(error)
+            # Retry only when the failure is caused by page overflow/layout size.
+            if not any(token in message for token in [
+                "المحتوى يحتاج صفحات إضافية",
+                "عنصر أكبر من الصفحة",
+                "تعذر تقسيم فقرة طويلة",
+            ]):
+                raise
+
+    raise RuntimeError(
+        "لا يمكن وضع كل محتوى السيرة في صفحة A4 واحدة بدون حذف محتوى أو تصغير الخط "
+        "إلى حجم غير مقروء. اختاري صفحتين/تلقائي أو قللي حجم الخط يدويًا. "
+        f"آخر خطأ: {last_error}"
+    )
 
 def prepare_photo(photo_bytes):
     if not photo_bytes:
