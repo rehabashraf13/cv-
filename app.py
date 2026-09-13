@@ -1010,17 +1010,27 @@ def interpret_formatting_instructions(text):
 
 
 
+# Date detection intentionally puts the MOST SPECIFIC patterns first.
+# This is important for nursing/training CVs where dates are often written as
+# "3months -2026", "3 months-2026", "6 mos. / 2025", etc.  A bare year
+# must never win over the complete duration+year expression.
 UI_DATE_RE = re.compile(
     r"(?ix)(?:"
-    r"\b(?:19|20)\d{2}\b\s*[-–—/]\s*(?:present|current|now|(?:19|20)\d{2})\b"
-    r"|\b(?:19|20)\d{2}\b"
-    r"|\b(?:present|current|now)\b"
+    r"\b\d+\s*[- ]?\s*(?:month|months|mos\.?|year|years|yrs\.?)\s*[-–—/]?\s*(?:19|20)\d{2}\b"
+    r"|\b\d+\s*(?:شهر|شهور|أشهر|اشهر|سنة|سنوات)\s*[-–—/]?\s*(?:19|20)\d{2}\b"
+    r"|\b(?:19|20)\d{2}\b\s*[-–—/]\s*(?:present|current|now|(?:19|20)\d{2})\b"
     r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?:19|20)\d{2}\b"
-    r"|\b\d{1,2}[/-]\d{1,2}[/-](?:19|20)?\d{2}\b"
-    r"|\b\d+\s*(?:month|months|mos|year|years|yrs)\s*[-–—/]?\s*(?:19|20)\d{2}\b"
     r"|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)\s+\d{4}"
+    r"|\b\d{1,2}[/-]\d{1,2}[/-](?:19|20)?\d{2}\b"
+    r"|\b(?:present|current|now)\b"
+    r"|\b(?:19|20)\d{2}\b"
     r")"
 )
+
+DURATION_ONLY_RE = re.compile(
+    r"(?ix)^\s*\d+\s*[- ]?\s*(?:month|months|mos\.?|year|years|yrs\.?|شهر|شهور|أشهر|اشهر|سنة|سنوات)\s*[-–—/]?\s*$"
+)
+YEAR_ONLY_RE = re.compile(r"(?ix)^\s*[-–—/]?\s*(?:19|20)\d{2}\s*$")
 
 def extract_date_candidates(text):
     """Return date-like substrings without changing source text."""
@@ -1278,17 +1288,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
 
         return items or [joined]
 
-    DATE_RE = re.compile(
-        r"(?ix)(?:"
-        r"\b(?:19|20)\d{2}\b\s*[-–—/]\s*(?:present|current|now|(?:19|20)\d{2})\b"
-        r"|\b(?:19|20)\d{2}\b"
-        r"|\b(?:present|current|now)\b"
-        r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?:19|20)\d{2}\b"
-        r"|\b\d{1,2}[/-]\d{1,2}[/-](?:19|20)?\d{2}\b"
-        r"|\b\d+\s*(?:month|months|mos|year|years|yrs)\s*[-–—/]?\s*(?:19|20)\d{2}\b"
-        r"|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)\s+\d{4}"
-        r")"
-    )
+    # Same detector used by the UI, so preview and exported PDF agree exactly.
+    DATE_RE = UI_DATE_RE
 
     def apply_manual_newlines_html(text, rendered_html):
         """Insert visual line breaks before existing user-selected text without changing wording."""
@@ -1308,11 +1309,23 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         parts.append(html.escape(text[cursor:]))
         return "".join(parts)
 
+    def _best_auto_date_match(text):
+        """Return the most complete date expression, never a shorter year inside it."""
+        matches = list(DATE_RE.finditer(text or ""))
+        if not matches:
+            return None
+        # Prefer longer expressions (e.g. 3months -2026) over a bare 2026.
+        # For equal lengths keep the earliest visual occurrence.
+        return sorted(matches, key=lambda m: (-(m.end() - m.start()), m.start()))[0]
+
     def find_date_match(text, section_key, kind):
-        """Prefer user-confirmed date text, otherwise use the broad date detector."""
+        """Prefer complete date expressions; user choices remain authoritative."""
         chosen = manual_dates.get(section_key, manual_dates.get(kind, []))
         if isinstance(chosen, str):
             chosen = [chosen]
+
+        auto = _best_auto_date_match(text)
+        manual_matches = []
         for candidate in sorted([c for c in chosen if c], key=len, reverse=True):
             idx = text.find(candidate)
             if idx >= 0:
@@ -1322,8 +1335,23 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                     def start(self): return self._start
                     def end(self): return self._end
                     def group(self, _=0): return self._value
-                return _ManualMatch(idx, idx + len(candidate), candidate)
-        return DATE_RE.search(text)
+                manual_matches.append(_ManualMatch(idx, idx + len(candidate), candidate))
+
+        if manual_matches:
+            manual = manual_matches[0]
+            # If the manual UI only saw a bare year but the same source line
+            # contains a longer expression including that year, keep the full date.
+            if auto is not None:
+                manual_value = manual.group(0).strip()
+                auto_value = auto.group(0).strip()
+                if (
+                    re.fullmatch(r"(?:19|20)\d{2}", manual_value)
+                    and manual_value in auto_value
+                    and len(auto_value) > len(manual_value)
+                ):
+                    return auto
+            return manual
+        return auto
 
     def style_existing_text(text, kind, index=0):
         """Style existing source text only; never rewrite or generate CV wording."""
@@ -1413,7 +1441,9 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         use_bullets = bool(section_bullets.get(section_key, section_bullets.get(kind, False)))
         date_position = date_positions.get(section_key, date_positions.get(kind, "inline"))
         blocks = []
-        for index, text in enumerate(texts):
+        index = 0
+        while index < len(texts):
+            text = texts[index]
             cls = "entry-line"
             prefix = ""
             # If the selected section has a one-line entry, that line itself must
@@ -1423,6 +1453,27 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             if should_bullet:
                 prefix = bullet_style + " "
                 cls += " bullet-line"
+
+            # Some PDFs visually contain "3months -2026" in one date column but
+            # text extraction splits it into two source lines: "3months -" and
+            # "2026". Treat those adjacent fragments as ONE date for layout while
+            # preserving every original character. No CV wording is generated.
+            if (
+                date_position in {"left", "right"}
+                and index + 1 < len(texts)
+                and DURATION_ONLY_RE.fullmatch(text or "")
+                and YEAR_ONLY_RE.fullmatch(texts[index + 1] or "")
+            ):
+                next_text = texts[index + 1]
+                combined_date = (text.rstrip() + " " + next_text.lstrip()).strip()
+                blocks.append(
+                    f'<div class="entry-date-row date-{date_position}" dir="auto">'
+                    f'<span class="entry-date">{html.escape(combined_date)}</span>'
+                    f'<span class="entry-primary"></span></div>'
+                )
+                index += 2
+                continue
+
             rendered = prefix + text
             date_match = find_date_match(text, section_key, kind)
             if date_match and date_position in {"left", "right"}:
@@ -1439,8 +1490,10 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                     f'<span class="entry-date">{date_html}</span>'
                     f'<span class="entry-primary">{remaining_html}</span></div>'
                 )
+                index += 1
                 continue
             blocks.append(paragraph_html(rendered, cls, kind, index))
+            index += 1
         return blocks
 
     for section_index, section in enumerate(sections):
@@ -4148,4 +4201,3 @@ ui_html("""
     أنشئي. خصّصي. حمّلي.
 </footer>
 """)
-
