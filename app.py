@@ -1009,6 +1009,28 @@ def interpret_formatting_instructions(text):
     return settings, warnings
 
 
+
+UI_DATE_RE = re.compile(
+    r"(?ix)(?:"
+    r"\b(?:19|20)\d{2}\b\s*[-–—/]\s*(?:present|current|now|(?:19|20)\d{2})\b"
+    r"|\b(?:19|20)\d{2}\b"
+    r"|\b(?:present|current|now)\b"
+    r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?:19|20)\d{2}\b"
+    r"|\b\d{1,2}[/-]\d{1,2}[/-](?:19|20)?\d{2}\b"
+    r"|\b\d+\s*(?:month|months|mos|year|years|yrs)\s*[-–—/]?\s*(?:19|20)\d{2}\b"
+    r"|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)\s+\d{4}"
+    r")"
+)
+
+def extract_date_candidates(text):
+    """Return date-like substrings without changing source text."""
+    found = []
+    for m in UI_DATE_RE.finditer(text or ""):
+        value = m.group(0).strip()
+        if value and value not in found:
+            found.append(value)
+    return found
+
 def normalized_content_snapshot(mapping, lines):
     """Formatting-independent integrity snapshot of authorized CV source data."""
     validate_mapping(mapping, lines)
@@ -1055,6 +1077,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     date_positions = options.get("date_positions", {}) or {}
     bold_fields = options.get("bold_fields", {}) or {}
     custom_bold_text = [str(x).strip() for x in (options.get("custom_bold_text", []) or []) if str(x).strip()]
+    new_line_before_text = [str(x).strip() for x in (options.get("new_line_before_text", []) or []) if str(x).strip()]
+    manual_dates = options.get("manual_dates", {}) or {}
 
     safe_font = {
         "Arial": 'Arial, "Segoe UI", sans-serif',
@@ -1254,7 +1278,52 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
 
         return items or [joined]
 
-    DATE_RE = re.compile(r"(?i)(?:\b(?:19|20)\d{2}\b(?:\s*[-–—/]\s*(?:present|current|now|(?:19|20)\d{2}))?|\b(?:present|current|now)\b|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)\s+\d{4})")
+    DATE_RE = re.compile(
+        r"(?ix)(?:"
+        r"\b(?:19|20)\d{2}\b\s*[-–—/]\s*(?:present|current|now|(?:19|20)\d{2})\b"
+        r"|\b(?:19|20)\d{2}\b"
+        r"|\b(?:present|current|now)\b"
+        r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?:19|20)\d{2}\b"
+        r"|\b\d{1,2}[/-]\d{1,2}[/-](?:19|20)?\d{2}\b"
+        r"|\b\d+\s*(?:month|months|mos|year|years|yrs)\s*[-–—/]?\s*(?:19|20)\d{2}\b"
+        r"|(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)\s+\d{4}"
+        r")"
+    )
+
+    def apply_manual_newlines_html(text, rendered_html):
+        """Insert visual line breaks before existing user-selected text without changing wording."""
+        matches = [value for value in new_line_before_text if value and value in text]
+        if not matches:
+            return rendered_html
+        # Re-render from raw text so we can safely insert <br> only at requested boundaries.
+        parts = []
+        cursor = 0
+        pattern = re.compile("|".join(re.escape(v) for v in sorted(set(matches), key=len, reverse=True)))
+        for m in pattern.finditer(text):
+            parts.append(html.escape(text[cursor:m.start()]))
+            if m.start() > 0:
+                parts.append("<br>")
+            parts.append(html.escape(m.group(0)))
+            cursor = m.end()
+        parts.append(html.escape(text[cursor:]))
+        return "".join(parts)
+
+    def find_date_match(text, section_key, kind):
+        """Prefer user-confirmed date text, otherwise use the broad date detector."""
+        chosen = manual_dates.get(section_key, manual_dates.get(kind, []))
+        if isinstance(chosen, str):
+            chosen = [chosen]
+        for candidate in sorted([c for c in chosen if c], key=len, reverse=True):
+            idx = text.find(candidate)
+            if idx >= 0:
+                class _ManualMatch:
+                    def __init__(self, start, end, value):
+                        self._start, self._end, self._value = start, end, value
+                    def start(self): return self._start
+                    def end(self): return self._end
+                    def group(self, _=0): return self._value
+                return _ManualMatch(idx, idx + len(candidate), candidate)
+        return DATE_RE.search(text)
 
     def style_existing_text(text, kind, index=0):
         """Style existing source text only; never rewrite or generate CV wording."""
@@ -1293,6 +1362,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
 
     def paragraph_html(text, class_name="", kind=None, index=0):
         body = style_existing_text(text, kind, index) if kind else html.escape(text)
+        body = apply_manual_newlines_html(text, body)
         return f'<p class="{class_name}" dir="auto">{body}</p>'
 
     def entry_blocks(group, kind, section_key=None, skill_like=False):
@@ -1354,7 +1424,7 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                 prefix = bullet_style + " "
                 cls += " bullet-line"
             rendered = prefix + text
-            date_match = DATE_RE.search(text)
+            date_match = find_date_match(text, section_key, kind)
             if date_match and date_position in {"left", "right"}:
                 date_text = date_match.group(0)
                 remaining = (
@@ -3575,6 +3645,7 @@ with st.container(key="builder"):
             present_section_options = []
             present_section_labels = {}
             present_section_kind = {}
+            present_section_line_ids = {}
             if parsed_for_controls:
                 _lines_lookup = {line["id"]: line["text"].strip() for line in parsed_for_controls["lines"]}
                 _seen_labels = {}
@@ -3600,9 +3671,14 @@ with st.container(key="builder"):
                     present_section_options.append(_key)
                     present_section_labels[_key] = _label
                     present_section_kind[_key] = _kind
+                    _ids = list(_section.get("heading_ids", []))
+                    for _group in _section.get("groups", []):
+                        _ids.extend(_group)
+                    present_section_line_ids[_key] = _ids
             section_bullets = {}
             date_positions = {}
             bold_fields = {}
+            manual_dates = {}
             bullet_kinds = []
             if present_section_options:
                 st.markdown("**إعدادات كل قسم**")
@@ -3637,19 +3713,97 @@ with st.container(key="builder"):
                             key=f"cv_date_{section_key}",
                         )
                         date_positions[section_key] = pos
+                        # Let the user confirm unusual date formats for this exact section.
+                        _date_candidates = []
+                        for _line_id in present_section_line_ids.get(section_key, []):
+                            _text = _lines_lookup.get(_line_id, "")
+                            for _candidate in extract_date_candidates(_text):
+                                if _candidate not in _date_candidates:
+                                    _date_candidates.append(_candidate)
+                        if _date_candidates:
+                            manual_dates[section_key] = st.multiselect(
+                                f"حددي نصوص التاريخ — {label}",
+                                _date_candidates,
+                                default=_date_candidates,
+                                key=f"cv_manual_dates_{section_key}",
+                                help="مفيد لصيغ مثل 3 months-2024 أو 2022–Present أو 11/08/2026. الاختيار هنا أعلى أولوية من الاكتشاف التلقائي.",
+                            )
                 bold_degree = st.checkbox("اجعل اسم الدرجة/الشهادة في التعليم Bold", key="cv_bold_degree")
                 bold_job = st.checkbox("اجعل Job/Training Title Bold", key="cv_bold_job")
                 if bold_degree: bold_fields["education"] = ["degree"]
                 if bold_job:
                     bold_fields["experience"] = ["job_title"]
                     bold_fields["training"] = ["training_title"]
+            selected_bold_texts = []
+            if parsed_for_controls:
+                _bold_options = [line["id"] for line in parsed_for_controls["lines"] if line.get("text", "").strip()]
+                _bold_lookup = {line["id"]: line.get("text", "").strip() for line in parsed_for_controls["lines"]}
+                selected_bold_ids = st.multiselect(
+                    "اختاري الجمل الموجودة التي تريدين جعلها Bold",
+                    _bold_options,
+                    default=[],
+                    format_func=lambda line_id: _bold_lookup.get(line_id, str(line_id)),
+                    key="cv_bold_existing_lines",
+                    help="الاختيارات مأخوذة من نص هذه السيرة نفسها، لذلك لا يوجد خطر كتابة الجملة بشكل مختلف.",
+                )
+                selected_bold_texts = [_bold_lookup[i] for i in selected_bold_ids if i in _bold_lookup]
+
             custom_bold_raw = st.text_input(
-                "حددي النص أو الجمل الموجودة التي تريدين جعلها Bold",
+                "أو اكتبي جزءًا موجودًا من الجملة ليصبح Bold",
                 key="cv_custom_bold_text",
                 placeholder="مثال: Registered Nurse | Emergency Department",
                 help="افصلي بين أكثر من نص بعلامة |. لن تتم إضافة أي نص جديد؛ يتم تنسيق النص الموجود فقط.",
             )
-            custom_bold_text = [x.strip() for x in custom_bold_raw.split("|") if x.strip()]
+            custom_bold_text = selected_bold_texts + [x.strip() for x in custom_bold_raw.split("|") if x.strip()]
+
+            new_line_selected_texts = []
+            if parsed_for_controls:
+                _newline_options = [line["id"] for line in parsed_for_controls["lines"] if line.get("text", "").strip()]
+                _newline_lookup = {line["id"]: line.get("text", "").strip() for line in parsed_for_controls["lines"]}
+                _newline_ids = st.multiselect(
+                    "ابدئي الجمل التالية من سطر جديد",
+                    _newline_options,
+                    default=[],
+                    format_func=lambda line_id: _newline_lookup.get(line_id, str(line_id)),
+                    key="cv_newline_existing_lines",
+                    help="مفيد عندما يدمج الاستخراج جملًا أو مهارات مع بعضها.",
+                )
+                new_line_selected_texts = [_newline_lookup[i] for i in _newline_ids if i in _newline_lookup]
+            new_line_raw = st.text_input(
+                "أو اكتبي كلمة/عبارة يبدأ قبلها سطر جديد",
+                key="cv_newline_before_text",
+                placeholder="مثال: Language | Certifications",
+                help="افصلي بين أكثر من عبارة بعلامة |. النص نفسه لا يتغير؛ يضاف كسر سطر بصري فقط.",
+            )
+            new_line_before_text = new_line_selected_texts + [x.strip() for x in new_line_raw.split("|") if x.strip()]
+
+            # User-authorized content edits: edit existing source lines only.
+            authorized_line_edits = st.session_state.setdefault("cv_authorized_line_edits", {})
+            if parsed_for_controls:
+                with st.expander("تعديل محتوى السيرة يدويًا — اختياري"):
+                    st.caption("أي تعديل هنا يعتبر تعديلًا منك أنتِ، وليس محتوى مولدًا من الذكاء الاصطناعي.")
+                    _edit_options = [line["id"] for line in parsed_for_controls["lines"] if line.get("text", "").strip()]
+                    _edit_lookup = {line["id"]: line.get("text", "").strip() for line in parsed_for_controls["lines"]}
+                    _edit_id = st.selectbox(
+                        "اختاري السطر المراد تعديله",
+                        _edit_options,
+                        format_func=lambda line_id: _edit_lookup.get(line_id, str(line_id)),
+                        key="cv_edit_line_id",
+                    ) if _edit_options else None
+                    if _edit_id is not None:
+                        _current_edit = authorized_line_edits.get(_edit_id, _edit_lookup.get(_edit_id, ""))
+                        _edited_value = st.text_area(
+                            "النص بعد تعديلك",
+                            value=_current_edit,
+                            key=f"cv_edit_line_value_{_edit_id}",
+                        )
+                        _c1, _c2 = st.columns(2)
+                        if _c1.button("حفظ تعديل السطر", key=f"cv_save_edit_{_edit_id}"):
+                            authorized_line_edits[_edit_id] = _edited_value
+                            st.success("تم حفظ التعديل اليدوي لهذا السطر.")
+                        if _c2.button("استرجاع النص الأصلي", key=f"cv_reset_edit_{_edit_id}"):
+                            authorized_line_edits.pop(_edit_id, None)
+                            st.rerun()
 
             compactness = st.selectbox(
                 "كثافة التنسيق",
@@ -3718,6 +3872,9 @@ with st.container(key="builder"):
                 "date_positions": date_positions,
                 "bold_fields": bold_fields,
                 "custom_bold_text": custom_bold_text,
+                "new_line_before_text": new_line_before_text,
+                "manual_dates": manual_dates,
+                "authorized_line_edits": authorized_line_edits,
                 "manual_override_skills": manual_override_skills,
                 "manual_override_contact": manual_override_contact,
             },
@@ -3728,6 +3885,7 @@ with st.container(key="builder"):
     if st.session_state.get("source_signature") != source_signature:
         st.session_state.pop("parsed_cv", None)
         st.session_state.pop("pdf_result", None)
+        st.session_state.pop("cv_authorized_line_edits", None)
         st.session_state["source_signature"] = source_signature
 
     if st.session_state.get("design_signature") != design_signature:
@@ -3857,6 +4015,8 @@ with st.container(key="builder"):
                     "date_positions": date_positions,
                     "bold_fields": bold_fields,
                     "custom_bold_text": custom_bold_text,
+                    "new_line_before_text": new_line_before_text,
+                    "manual_dates": manual_dates,
                 }
                 # Custom prompt changes formatting only. Explicit manual override toggles win.
                 if "skills_layout" in prompt_settings and not manual_override_skills:
@@ -3864,17 +4024,23 @@ with st.container(key="builder"):
                 if "contact_position" in prompt_settings and not manual_override_contact:
                     render_options["contact_position"] = prompt_settings["contact_position"]
 
-                before_snapshot = normalized_content_snapshot(parsed["mapping"], parsed["lines"])
+                # Apply only user-authorized text edits while preserving stable source IDs/mapping.
+                render_lines = copy.deepcopy(parsed["lines"])
+                for _line in render_lines:
+                    if _line["id"] in authorized_line_edits:
+                        _line["text"] = authorized_line_edits[_line["id"]]
+
+                before_snapshot = normalized_content_snapshot(parsed["mapping"], render_lines)
                 pdf, used_options = render_cv_with_smart_fit(
                     parsed["mapping"],
-                    parsed["lines"],
+                    render_lines,
                     language,
                     style,
                     photo,
                     render_options,
                     progress=lambda message: status.info(message),
                 )
-                after_snapshot = normalized_content_snapshot(parsed["mapping"], parsed["lines"])
+                after_snapshot = normalized_content_snapshot(parsed["mapping"], render_lines)
                 if before_snapshot != after_snapshot:
                     raise ValueError("Integrity check failed: CV content changed during formatting. PDF was not accepted.")
                 st.session_state["pdf_result"] = pdf
@@ -3982,3 +4148,4 @@ ui_html("""
     أنشئي. خصّصي. حمّلي.
 </footer>
 """)
+
