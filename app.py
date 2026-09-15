@@ -1089,6 +1089,10 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     custom_bold_text = [str(x).strip() for x in (options.get("custom_bold_text", []) or []) if str(x).strip()]
     new_line_before_text = [str(x).strip() for x in (options.get("new_line_before_text", []) or []) if str(x).strip()]
     manual_dates = options.get("manual_dates", {}) or {}
+    typed_dates = options.get("typed_dates", {}) or {}
+    section_first_line_bold = options.get("section_first_line_bold", {}) or {}
+    manual_section_names = options.get("manual_section_names", {}) or {}
+    manual_section_types = options.get("manual_section_types", {}) or {}
 
     safe_font = {
         "Arial": 'Arial, "Segoe UI", sans-serif',
@@ -1393,8 +1397,27 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         body = apply_manual_newlines_html(text, body)
         return f'<p class="{class_name}" dir="auto">{body}</p>'
 
-    def entry_blocks(group, kind, section_key=None, skill_like=False):
+    def entry_blocks(group, kind, section_key=None, skill_like=False, group_index=0):
         texts = [by_id[i]["text"].strip() for i in group]
+        # A manually typed date is authoritative for this exact entry. This is
+        # user-authored content, so we do not ask the AI to interpret its format.
+        typed_for_section = typed_dates.get(section_key, [])
+        if isinstance(typed_for_section, str):
+            typed_for_section = [typed_for_section]
+        typed_date = (typed_for_section[group_index].strip()
+                      if group_index < len(typed_for_section) and typed_for_section[group_index] else "")
+        if typed_date:
+            cleaned = []
+            for _t in texts:
+                _m = _best_auto_date_match(_t)
+                if _m:
+                    _t = (_t[:_m.start()] + _t[_m.end():]).strip(" -–—|,:")
+                # suppress orphan duration fragments when replacing the date manually
+                if DURATION_ONLY_RE.fullmatch(_t or "") or YEAR_ONLY_RE.fullmatch(_t or ""):
+                    _t = ""
+                if _t:
+                    cleaned.append(_t)
+            texts = cleaned
 
         if kind == "summary":
             return [paragraph_html(" ".join(texts), kind=kind)]
@@ -1441,6 +1464,18 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         use_bullets = bool(section_bullets.get(section_key, section_bullets.get(kind, False)))
         date_position = date_positions.get(section_key, date_positions.get(kind, "inline"))
         blocks = []
+        if typed_date and date_position in {"left", "right"}:
+            # Put the user-typed date in a real edge column; no date parsing involved.
+            primary = texts[0] if texts else ""
+            primary_html = style_existing_text(primary, kind, 0)
+            if section_first_line_bold.get(section_key, False):
+                primary_html = "<strong>" + html.escape(primary) + "</strong>"
+            blocks.append(
+                f'<div class="entry-date-row date-{date_position}" dir="auto">'
+                f'<span class="entry-date">{html.escape(typed_date)}</span>'
+                f'<span class="entry-primary">{primary_html}</span></div>'
+            )
+            texts = texts[1:]
         index = 0
         while index < len(texts):
             text = texts[index]
@@ -1492,21 +1527,42 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                 )
                 index += 1
                 continue
-            blocks.append(paragraph_html(rendered, cls, kind, index))
+            if index == 0 and section_first_line_bold.get(section_key, False):
+                body = "<strong>" + html.escape(rendered) + "</strong>"
+                blocks.append(f'<p class="{cls}" dir="auto">{body}</p>')
+            else:
+                blocks.append(paragraph_html(rendered, cls, kind, index))
             index += 1
         return blocks
 
     for section_index, section in enumerate(sections):
-        kind = section["kind"]
-        section_key = f"{kind}__{section_index}"
-        heading = original(section["heading_ids"]) if section["heading_ids"] else ""
-        skill_like = is_skill_like_section(kind, heading)
+        original_kind = section["kind"]
+        section_key = f"{original_kind}__{section_index}"
+        # Manual section controls are authoritative. The AI classification is only
+        # an initial suggestion; the user can rename/retype every detected section.
+        kind = manual_section_types.get(section_key, original_kind) or original_kind
+        source_heading = original(section["heading_ids"]) if section["heading_ids"] else ""
+        heading = manual_section_names.get(section_key, source_heading)
+        if heading is None:
+            heading = source_heading
+        heading = str(heading).strip()
+        skill_like = (kind == "skills") or is_skill_like_section(kind, heading)
 
-        target = (
-            side_blocks
-            if has_side and (kind in {"education", "languages"} or skill_like)
-            else main_blocks
-        )
+        # Sidebar template layout:
+        # WHITE area: Professional Summary, Languages, Experience,
+        #             Clinical Training
+        # BLUE area: all other CV sections.
+        white_area_kinds = {
+            "summary",
+            "languages",
+            "experience",
+            "clinical_training",
+        }
+
+        if has_side:
+            target = main_blocks if kind in white_area_kinds else side_blocks
+        else:
+            target = main_blocks
 
         if heading:
             target.append('<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>")
@@ -1559,8 +1615,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                     + "</div>"
                 )
         else:
-            for group in section["groups"]:
-                target.extend(entry_blocks(group, kind, section_key, skill_like=False))
+            for group_index, group in enumerate(section["groups"]):
+                target.extend(entry_blocks(group, kind, section_key, skill_like=False, group_index=group_index))
 
     css = """
     @page { size: A4; margin: 0; }
@@ -3732,55 +3788,128 @@ with st.container(key="builder"):
             date_positions = {}
             bold_fields = {}
             manual_dates = {}
+            typed_dates = {}
+            section_first_line_bold = {}
+            manual_section_names = {}
+            manual_section_types = {}
             bullet_kinds = []
             if present_section_options:
                 st.markdown("**إعدادات كل قسم**")
-                st.caption("الأقسام التالية مأخوذة من هذه السيرة نفسها. اختاري فقط الأقسام التي تريدين أن يظهر محتواها بنقاط.")
+                st.caption("الأقسام التالية مأخوذة من هذه السيرة نفسها. الـAI هنا مجرد اقتراح أولي؛ إنتِ صاحبة القرار النهائي في اسم ونوع كل قسم.")
+
+                st.markdown("**1) راجعي أسماء وأنواع الأقسام يدويًا**")
+                section_type_choices = [
+                    "summary", "experience", "clinical_training", "training",
+                    "education", "skills", "languages", "certifications",
+                    "licenses", "projects", "courses", "volunteer", "references", "custom"
+                ]
+                section_type_labels = {
+                    "summary": "Summary / ملخص",
+                    "experience": "Experience / خبرات",
+                    "clinical_training": "Clinical Training / تدريب سريري",
+                    "training": "Training / تدريب",
+                    "education": "Education / تعليم",
+                    "skills": "Skills / مهارات",
+                    "languages": "Languages / لغات",
+                    "certifications": "Certifications / شهادات",
+                    "licenses": "Licensure / ترخيص مهني",
+                    "projects": "Projects / مشاريع",
+                    "courses": "Courses / دورات",
+                    "volunteer": "Volunteer / تطوع",
+                    "references": "References / مراجع",
+                    "custom": "Other / قسم آخر",
+                }
+                for _section_key in present_section_options:
+                    _current_label = present_section_labels.get(_section_key, _section_key)
+                    _current_kind = present_section_kind.get(_section_key, "custom")
+                    _default_type = _current_kind if _current_kind in section_type_choices else "custom"
+                    _c1, _c2 = st.columns([1.55, 1])
+                    with _c1:
+                        manual_section_names[_section_key] = st.text_input(
+                            f"اسم القسم — {_current_label}",
+                            value=_current_label,
+                            key=f"cv_manual_section_name_{_section_key}",
+                            help="الاسم المكتوب هنا هو الذي سيظهر في الـCV. لن يضيف البرنامج اسم قسم من عنده.",
+                        ).strip()
+                    with _c2:
+                        manual_section_types[_section_key] = st.selectbox(
+                            f"نوع القسم — {_current_label}",
+                            section_type_choices,
+                            index=section_type_choices.index(_default_type),
+                            format_func=lambda value: section_type_labels[value],
+                            key=f"cv_manual_section_type_{_section_key}",
+                            help="اختاري Skills لو القسم مهارات حتى لو اسمه Professional Skills أو Core Competencies. اختاري Experience أو Clinical Training لتفعيل التاريخ اليدوي والمسمى الوظيفي Bold.",
+                        )
+
+                # From this point onward, labels/types use the user's manual decisions.
+                effective_section_labels = {
+                    key: (manual_section_names.get(key) or present_section_labels.get(key, key))
+                    for key in present_section_options
+                }
+                effective_section_kind = {
+                    key: manual_section_types.get(key, present_section_kind.get(key, "custom"))
+                    for key in present_section_options
+                }
+
+                st.markdown("**2) اختاري الأقسام التي تريدين لها نقاطًا**")
                 bullet_kinds = st.multiselect(
                     "الأقسام التي تريدين لها نقاطًا",
                     present_section_options,
                     default=[],
-                    format_func=lambda key: present_section_labels.get(key, key),
+                    format_func=lambda key: effective_section_labels.get(key, key),
                     key="cv_bullet_sections",
                     help="كل CV يعرض أقسامه الفعلية فقط، حتى لو كان فيه أقسام مخصصة أو أسماء مختلفة.",
                 )
                 section_bullets = {key: (key in bullet_kinds) for key in present_section_options}
-                st.caption("يمكنك تحديد مكان التاريخ بشكل مستقل لكل قسم موجود في هذه السيرة. إذا لم يوجد تاريخ في القسم فلن يتغير شيء.")
+                # Manual date only:
+                # No date-position selector and no "select detected date texts".
+                # For Experience / Clinical Training / Training, the user types the
+                # complete date exactly as it should appear, and it is placed RIGHT.
                 for section_key in present_section_options:
-                    k = present_section_kind[section_key]
-                    label = present_section_labels.get(section_key, k)
+                    k = effective_section_kind[section_key]
+                    label = effective_section_labels.get(section_key, k)
                     label_low = label.lower()
-                    skill_like_ui = any(token in label_low for token in [
-                        "skill", "competenc", "expertise", "proficien", "capabilit",
-                        "abilit", "strength", "مهار", "كفاء", "قدرات"
-                    ])
-                    if k not in {"summary", "languages", "references"} and not skill_like_ui:
-                        pos = st.selectbox(
-                            f"مكان التاريخ — {label}",
-                            ["inline", "left", "right"],
-                            format_func=lambda value: {
-                                "inline": "داخل السطر",
-                                "left": "يسار",
-                                "right": "يمين",
-                            }[value],
-                            key=f"cv_date_{section_key}",
-                        )
-                        date_positions[section_key] = pos
-                        # Let the user confirm unusual date formats for this exact section.
-                        _date_candidates = []
-                        for _line_id in present_section_line_ids.get(section_key, []):
-                            _text = _lines_lookup.get(_line_id, "")
-                            for _candidate in extract_date_candidates(_text):
-                                if _candidate not in _date_candidates:
-                                    _date_candidates.append(_candidate)
-                        if _date_candidates:
-                            manual_dates[section_key] = st.multiselect(
-                                f"حددي نصوص التاريخ — {label}",
-                                _date_candidates,
-                                default=_date_candidates,
-                                key=f"cv_manual_dates_{section_key}",
-                                help="مفيد لصيغ مثل 3 months-2024 أو 2022–Present أو 11/08/2026. الاختيار هنا أعلى أولوية من الاكتشاف التلقائي.",
+
+                    if k in {"experience", "clinical_training", "training", "internships"} or any(
+                        t in label_low for t in ["experience", "training", "clinical", "خبر", "تدريب"]
+                    ):
+                        # Manual typed dates always render in the right date column.
+                        date_positions[section_key] = "right"
+
+                        _section_obj = None
+                        _idx = int(section_key.rsplit("__", 1)[1])
+                        _non_personals = [
+                            x for x in parsed_for_controls["mapping"]["sections"]
+                            if x["kind"] != "personal"
+                        ]
+                        if 0 <= _idx < len(_non_personals):
+                            _section_obj = _non_personals[_idx]
+
+                        _typed = []
+                        if _section_obj:
+                            st.caption(
+                                f"✍️ اكتبي التاريخ بنفسك لكل مدخل في {label}. "
+                                "سيظهر كما كتبتيه بالكامل في يمين السطر، بدون أي تحليل أو تقسيم."
                             )
+                            for _gi, _group in enumerate(_section_obj.get("groups", [])):
+                                _preview = " ".join(
+                                    _lines_lookup.get(i, "") for i in _group[:2]
+                                ).strip()
+                                _preview = (_preview[:70] + "…") if len(_preview) > 70 else _preview
+                                _value = st.text_input(
+                                    f"التاريخ #{_gi+1} — {_preview}",
+                                    key=f"cv_typed_date_{section_key}_{_gi}",
+                                    placeholder="مثال: 3months -2026 أو 2022 – Present",
+                                    help="اكتبي التاريخ كاملًا كما تريدين ظهوره. لن يحاول البرنامج فهم صيغة التاريخ.",
+                                )
+                                _typed.append(_value)
+                            typed_dates[section_key] = _typed
+
+                        section_first_line_bold[section_key] = st.checkbox(
+                            f"اجعل أول سطر/المسمى الوظيفي تحت {label} Bold",
+                            value=True,
+                            key=f"cv_first_line_bold_{section_key}",
+                        )
                 bold_degree = st.checkbox("اجعل اسم الدرجة/الشهادة في التعليم Bold", key="cv_bold_degree")
                 bold_job = st.checkbox("اجعل Job/Training Title Bold", key="cv_bold_job")
                 if bold_degree: bold_fields["education"] = ["degree"]
@@ -3927,6 +4056,10 @@ with st.container(key="builder"):
                 "custom_bold_text": custom_bold_text,
                 "new_line_before_text": new_line_before_text,
                 "manual_dates": manual_dates,
+                "typed_dates": typed_dates,
+                "section_first_line_bold": section_first_line_bold,
+                "manual_section_names": manual_section_names,
+                "manual_section_types": manual_section_types,
                 "authorized_line_edits": authorized_line_edits,
                 "manual_override_skills": manual_override_skills,
                 "manual_override_contact": manual_override_contact,
@@ -4034,14 +4167,14 @@ with st.container(key="builder"):
                 prompt_bullets = prompt_settings.get("section_bullets_prompt", {})
                 if not bullet_kinds:
                     for _kind, _value in prompt_bullets.items():
-                        for _section_key, _section_kind in present_section_kind.items():
+                        for _section_key, _section_kind in effective_section_kind.items():
                             if _section_kind == _kind and _section_key in section_bullets:
                                 section_bullets[_section_key] = bool(_value)
 
                 # Date prompt may fill only an untouched/default Inline position.
                 prompt_dates = prompt_settings.get("date_positions_prompt", {})
                 for _k, _v in prompt_dates.items():
-                    for _section_key, _section_kind in present_section_kind.items():
+                    for _section_key, _section_kind in effective_section_kind.items():
                         if (
                             _section_kind == _k
                             and _section_key in date_positions
@@ -4070,6 +4203,10 @@ with st.container(key="builder"):
                     "custom_bold_text": custom_bold_text,
                     "new_line_before_text": new_line_before_text,
                     "manual_dates": manual_dates,
+                    "typed_dates": typed_dates,
+                    "section_first_line_bold": section_first_line_bold,
+                    "manual_section_names": manual_section_names,
+                    "manual_section_types": manual_section_types,
                 }
                 # Custom prompt changes formatting only. Explicit manual override toggles win.
                 if "skills_layout" in prompt_settings and not manual_override_skills:
