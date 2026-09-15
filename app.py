@@ -1092,7 +1092,8 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
     typed_dates = options.get("typed_dates", {}) or {}
     section_first_line_bold = options.get("section_first_line_bold", {}) or {}
     manual_section_names = options.get("manual_section_names", {}) or {}
-    manual_section_types = options.get("manual_section_types", {}) or {}
+    manual_section_types = options.get("manual_section_types", {})
+    manual_section_actions = options.get("manual_section_actions", {}) or {}
 
     safe_font = {
         "Arial": 'Arial, "Segoe UI", sans-serif',
@@ -1535,11 +1536,36 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
             index += 1
         return blocks
 
+    # Apply the user's section-structure decisions BEFORE rendering.
+    # "merge_previous" removes only the mistaken heading and appends all of its
+    # groups to the previous kept section. No source text is rewritten.
+    prepared_sections = []
     for section_index, section in enumerate(sections):
         original_kind = section["kind"]
         section_key = f"{original_kind}__{section_index}"
-        # Manual section controls are authoritative. The AI classification is only
-        # an initial suggestion; the user can rename/retype every detected section.
+        action = manual_section_actions.get(section_key, "keep")
+
+        if action == "remove":
+            continue
+
+        if action == "merge_previous" and prepared_sections:
+            prepared_sections[-1]["section"]["groups"].extend(copy.deepcopy(section.get("groups", [])))
+            prepared_sections[-1]["section"]["roles"].extend(copy.deepcopy(section.get("roles", [])))
+            continue
+
+        prepared_sections.append({
+            "section": copy.deepcopy(section),
+            "source_index": section_index,
+            "section_key": section_key,
+        })
+
+    for prepared in prepared_sections:
+        section = prepared["section"]
+        section_index = prepared["source_index"]
+        section_key = prepared["section_key"]
+        original_kind = section["kind"]
+
+        # Manual section controls are authoritative.
         kind = manual_section_types.get(section_key, original_kind) or original_kind
         source_heading = original(section["heading_ids"]) if section["heading_ids"] else ""
         heading = manual_section_names.get(section_key, source_heading)
@@ -1549,66 +1575,40 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
         skill_like = (kind == "skills") or is_skill_like_section(kind, heading)
 
         # Sidebar template layout:
-        # WHITE area: Professional Summary, Languages, Experience,
-        #             Clinical Training
-        # BLUE area: all other CV sections.
-        white_area_kinds = {
-            "summary",
-            "languages",
-            "experience",
-            "clinical_training",
-        }
-
-        if has_side:
-            target = main_blocks if kind in white_area_kinds else side_blocks
-        else:
-            target = main_blocks
+        # WHITE: Summary, Languages, Experience, Clinical Training.
+        # BLUE: all other sections.
+        white_area_kinds = {"summary", "languages", "experience", "clinical_training"}
+        target = (main_blocks if kind in white_area_kinds else side_blocks) if has_side else main_blocks
 
         if heading:
             target.append('<h2 dir="auto">' + html.escape(heading_text(heading)) + "</h2>")
 
         if skill_like:
-            # IMPORTANT: preserve parser group boundaries as skill boundaries.
-            # The parser commonly stores one skill per group. Previously all IDs
-            # were flattened first, then split_skill_items() joined them with spaces;
-            # that turned the whole section into ONE item, so no separator could be
-            # inserted. Build the list from each source group instead.
             skill_items = []
             for group in section["groups"]:
                 group_texts = [by_id[i]["text"].strip() for i in group]
-                # If a source group itself contains explicit delimiters, preserve the
-                # wording and split only on those existing visual delimiters.
                 group_items = split_skill_items(group_texts)
                 if len(group_items) == 1 and len(group_texts) > 1:
-                    # Multiple source lines inside one group are distinct visible
-                    # skill lines unless the source itself joined them with a delimiter.
                     group_items = [t for t in group_texts if t]
-                skill_items.extend(item for item in group_items if item)
+                skill_items.extend(group_items)
 
-            use_bullets = bool(
-                section_bullets.get(section_key, section_bullets.get(kind, False))
-            )
-
+            use_bullets = bool(section_bullets.get(section_key, section_bullets.get(kind, False)))
             if skills_layout == "vertical":
-                prefix = (bullet_style + " ") if use_bullets else ""
-                target.extend(
-                    paragraph_html(
+                for i, item in enumerate(skill_items):
+                    prefix = (bullet_style + " ") if use_bullets else ""
+                    target.append(paragraph_html(
                         prefix + item,
                         "skill-line" + (" bullet-line" if use_bullets else ""),
                         kind,
                         i,
-                    )
-                    for i, item in enumerate(skill_items)
-                )
-            elif skill_items:
-                # Create ONE literal text flow. The separator is inserted into the
-                # text between every two skills, not as a standalone HTML node.
-                # This guarantees it survives Chromium layout/PDF generation.
+                    ))
+            else:
+                separator = f" {skills_separator} "
                 styled_items = [
                     style_existing_text(item, kind, i)
                     for i, item in enumerate(skill_items)
                 ]
-                separator_html = " " + html.escape(skills_separator) + " "
+                separator_html = html.escape(separator)
                 target.append(
                     '<div class="skills-inline" dir="auto">'
                     + separator_html.join(styled_items)
@@ -1616,7 +1616,10 @@ def build_html(mapping, lines, language, style, photo=None, options=None):
                 )
         else:
             for group_index, group in enumerate(section["groups"]):
-                target.extend(entry_blocks(group, kind, section_key, skill_like=False, group_index=group_index))
+                target.extend(entry_blocks(
+                    group, kind, section_key,
+                    skill_like=False, group_index=group_index
+                ))
 
     css = """
     @page { size: A4; margin: 0; }
@@ -3792,6 +3795,7 @@ with st.container(key="builder"):
             section_first_line_bold = {}
             manual_section_names = {}
             manual_section_types = {}
+            manual_section_actions = {}
             bullet_kinds = []
             if present_section_options:
                 st.markdown("**إعدادات كل قسم**")
@@ -3819,27 +3823,55 @@ with st.container(key="builder"):
                     "references": "References / مراجع",
                     "custom": "Other / قسم آخر",
                 }
-                for _section_key in present_section_options:
+                section_action_choices = ["keep", "merge_previous", "remove"]
+                section_action_labels = {
+                    "keep": "Keep as Section / احتفظ به كقسم",
+                    "merge_previous": "Merge with previous / ادمجه مع القسم السابق",
+                    "remove": "Remove section + content / احذف القسم ومحتواه",
+                }
+
+                for _section_pos, _section_key in enumerate(present_section_options):
                     _current_label = present_section_labels.get(_section_key, _section_key)
                     _current_kind = present_section_kind.get(_section_key, "custom")
                     _default_type = _current_kind if _current_kind in section_type_choices else "custom"
-                    _c1, _c2 = st.columns([1.55, 1])
-                    with _c1:
-                        manual_section_names[_section_key] = st.text_input(
-                            f"اسم القسم — {_current_label}",
-                            value=_current_label,
-                            key=f"cv_manual_section_name_{_section_key}",
-                            help="الاسم المكتوب هنا هو الذي سيظهر في الـCV. لن يضيف البرنامج اسم قسم من عنده.",
-                        ).strip()
-                    with _c2:
-                        manual_section_types[_section_key] = st.selectbox(
-                            f"نوع القسم — {_current_label}",
-                            section_type_choices,
-                            index=section_type_choices.index(_default_type),
-                            format_func=lambda value: section_type_labels[value],
-                            key=f"cv_manual_section_type_{_section_key}",
-                            help="اختاري Skills لو القسم مهارات حتى لو اسمه Professional Skills أو Core Competencies. اختاري Experience أو Clinical Training لتفعيل التاريخ اليدوي والمسمى الوظيفي Bold.",
-                        )
+
+                    st.markdown(f"**{_current_label}**")
+                    _action_options = section_action_choices if _section_pos > 0 else ["keep", "remove"]
+                    manual_section_actions[_section_key] = st.selectbox(
+                        f"التعامل مع القسم — {_current_label}",
+                        _action_options,
+                        index=0,
+                        format_func=lambda value: section_action_labels[value],
+                        key=f"cv_manual_section_action_{_section_key}",
+                        help=(
+                            "Merge with previous يشيل عنوان هذا القسم فقط ويضم كل محتواه للقسم السابق "
+                            "بدون حذف النص. Remove section + content يحذف العنوان والمحتوى من النسخة النهائية."
+                        ),
+                    )
+
+                    if manual_section_actions[_section_key] == "keep":
+                        _c1, _c2 = st.columns([1.55, 1])
+                        with _c1:
+                            manual_section_names[_section_key] = st.text_input(
+                                f"اسم القسم — {_current_label}",
+                                value=_current_label,
+                                key=f"cv_manual_section_name_{_section_key}",
+                                help="الاسم المكتوب هنا هو الذي سيظهر في الـCV. لن يضيف البرنامج اسم قسم من عنده.",
+                            ).strip()
+                        with _c2:
+                            manual_section_types[_section_key] = st.selectbox(
+                                f"نوع القسم — {_current_label}",
+                                section_type_choices,
+                                index=section_type_choices.index(_default_type),
+                                format_func=lambda value: section_type_labels[value],
+                                key=f"cv_manual_section_type_{_section_key}",
+                                help="إنتِ صاحبة القرار النهائي في نوع القسم؛ تصنيف الـAI مجرد اقتراح أولي.",
+                            )
+                    else:
+                        # Keep stable defaults internally; rendering action decides whether
+                        # the heading/content is merged or removed.
+                        manual_section_names[_section_key] = _current_label
+                        manual_section_types[_section_key] = _default_type
 
                 # From this point onward, labels/types use the user's manual decisions.
                 effective_section_labels = {
@@ -4207,6 +4239,7 @@ with st.container(key="builder"):
                     "section_first_line_bold": section_first_line_bold,
                     "manual_section_names": manual_section_names,
                     "manual_section_types": manual_section_types,
+                    "manual_section_actions": manual_section_actions,
                 }
                 # Custom prompt changes formatting only. Explicit manual override toggles win.
                 if "skills_layout" in prompt_settings and not manual_override_skills:
